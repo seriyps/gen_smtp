@@ -28,6 +28,7 @@
 		strchr/2,
 		strrchr/2,
 		strpos/2,
+		strpos/3,
 		strrpos/2,
 		substr/2,
 		substr/3,
@@ -79,6 +80,17 @@ strpos(Bin, C) when is_binary(Bin) ->
 			nomatch ->
 				0
     end.
+
+-spec strpos(Bin :: binary(), C :: binary(), StartFrom :: non_neg_integer()) ->
+					non_neg_integer().
+strpos(Bin, C, StartFrom) when is_binary(Bin),
+							   StartFrom >= 0 ->
+	case binary:match(Bin, C, [{scope, {StartFrom, byte_size(Bin) - StartFrom}}]) of
+		{Index, _Len} ->
+			Index + 1;
+		nomatch ->
+			0
+	end.
 
 -spec strrpos(Bin :: binary(), C :: binary() | list()) -> non_neg_integer().
 strrpos(Bin, C) ->

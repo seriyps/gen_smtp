@@ -68,7 +68,8 @@
 		extensions = [] :: [{string(), string()}],
 		waitingauth = false :: 'false' | 'plain' | 'login' | 'cram-md5',
 		authdata :: 'undefined' | binary(),
-		readmessage = false :: boolean(),
+		readmessage = false :: false | {Limit :: pos_integer(),
+                                        Accumulator :: binary()},
 		tls = false :: boolean(),
 		callbackstate :: any(),
 		options = [] :: [tuple()]
@@ -186,79 +187,9 @@ handle_cast(_Msg, State) ->
 
 %% @hidden
 -spec handle_info(Message :: any(), State :: #state{}) -> {'noreply', #state{}} | {'stop', any(), #state{}}.
-handle_info({receive_data, {error, size_exceeded}}, #state{readmessage = true} = State) ->
-	send(State, "552 Message too large\r\n"),
-	setopts(State, [{active, once}]),
-	{noreply, State#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT};
-handle_info({receive_data, {error, bare_newline}}, #state{readmessage = true} = State) ->
-	send(State, "451 Bare newline detected\r\n"),
-	setopts(State, [{active, once}]),
-	{noreply, State#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT};
-handle_info({receive_data, Body, Rest},
-			#state{socket = Socket, transport = Transport, readmessage = true, envelope = Env, module=Module,
-				   callbackstate = OldCallbackState,  extensions = Extensions} = State) ->
-	% send the remainder of the data...
-	case Rest of
-		<<>> -> ok; % no remaining data
-		_ -> self() ! {Transport:name(), Socket, Rest}
-	end,
-	setopts(State, [{packet, line}]),
-	%% Unescape periods at start of line (rfc5321 4.5.2)
-	UnescapedBody = re:replace(Body, <<"^\\\.">>, <<>>, [global, multiline, {return, binary}]),
-	Envelope = Env#envelope{data = UnescapedBody},% size = length(Body)},
-	Valid = case has_extension(Extensions, "SIZE") of
-		{true, Value} ->
-			case byte_size(Envelope#envelope.data) > list_to_integer(Value) of
-				true ->
-					send(State, "552 Message too large\r\n"),
-					setopts(State, [{active, once}]),
-					false;
-				false ->
-					true
-			end;
-		false ->
-			true
-	end,
-	case Valid of
-		true ->
-			case Module:handle_DATA(Envelope#envelope.from, Envelope#envelope.to, Envelope#envelope.data, OldCallbackState) of
-				{ok, Reference, CallbackState} ->
-					send(State, io_lib:format("250 queued as ~s\r\n", [Reference])),
-					setopts(State, [{active, once}]),
-					{noreply, State#state{readmessage = false,
-										  envelope = #envelope{},
-										  callbackstate = CallbackState}, ?TIMEOUT};
-				{error, Message, CallbackState} ->
-					send(State, [Message, "\r\n"]),
-					setopts(State, [{active, once}]),
-					{noreply, State#state{readmessage = false,
-										  envelope = #envelope{},
-										  callbackstate = CallbackState}, ?TIMEOUT}
-			end;
-		false ->
-			% might not even be able to get here anymore...
-			{noreply, State#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT}
-	end;
-handle_info({SocketType, Socket, Packet}, #state{socket = Socket, transport = Transport} = State)
+handle_info({SocketType, Socket, Packet}, #state{socket = Socket} = State)
   when SocketType =:= tcp; SocketType =:= ssl ->
-	case handle_request(parse_request(Packet), State) of
-		{ok,  #state{extensions = Extensions,  options = Options, readmessage = true} = NewState} ->
-			MaxSize = case has_extension(Extensions, "SIZE") of
-				{true, Value} ->
-					list_to_integer(Value);
-				false ->
-					?MAXIMUMSIZE
-			end,
-			Session = self(),
-			Size = 0,
-			setopts(NewState, [{packet, raw}]),
-			%% TODO: change to receive asynchronously in the same process
-			spawn_opt(fun() ->
-							  receive_data(
-								[], Transport, Socket, 0, Size, MaxSize, Session, Options)
-					  end,
-					  [link, {fullsweep_after, 0}]),
-			{noreply, NewState, ?TIMEOUT};
+	case handle_net_packet(Packet, State) of
 		{ok, NewState} ->
 			setopts(NewState, [{active, once}]),
 			{noreply, NewState, ?TIMEOUT};
@@ -305,6 +236,33 @@ code_change(OldVsn, #state{module = Module, callbackstate = CallbackState} = Sta
 			_					   -> CallbackState
 		end,
 	{ok, State#state{callbackstate = CallbackState}}.
+
+-spec handle_net_packet(binary(), #state{}) -> {ok, #state{}} | {stop, any(), #state{}}.
+handle_net_packet(Packet, #state{readmessage = false} = State) ->
+	handle_request(parse_request(Packet), State);
+handle_net_packet(Packet, #state{options = Options, readmessage = {Limit, Acc}} = State) ->
+	case handle_body_packet(Packet, Acc, Limit, Options) of
+		{continue, Acc1} ->
+			{ok, State#state{readmessage = {Limit, Acc1}}};
+		{done, Body, Rest} ->
+			State1 = handle_data_body(Body, State),
+            State2 = State1#state{readmessage = false, envelope = #envelope{}},
+			setopts(State2, [{packet, line}]),
+			case Rest of
+				<<>> -> {ok, State2};
+				_ ->
+					%% XXX: Rest can be multiple lines
+					handle_net_packet(Rest, State2)
+			end;
+		{error, bare_newline} ->
+			send(State, "451 Bare newline detected\r\n"),
+			setopts(State, [{packet, line}]),
+			{ok, State#state{readmessage = false, envelope = #envelope{}}};
+		{error, size_exceeded} ->
+			send(State, "552 Message too large\r\n"),
+			setopts(State, [{packet, line}]),
+			{ok, State#state{readmessage = false, envelope = #envelope{}}}
+	end.
 
 -spec parse_request(Packet :: binary()) -> {binary(), binary()}.
 parse_request(Packet) ->
@@ -605,7 +563,7 @@ handle_request({<<"RCPT">>, Args}, #state{envelope = Envelope, module = Module, 
 handle_request({<<"DATA">>, <<>>}, #state{envelope = undefined} = State) ->
 	send(State, "503 Error: send HELO/EHLO first\r\n"),
 	{ok, State};
-handle_request({<<"DATA">>, <<>>}, #state{envelope = Envelope} = State) ->
+handle_request({<<"DATA">>, <<>>}, #state{envelope = Envelope, extensions = Extensions} = State) ->
 	case {Envelope#envelope.from, Envelope#envelope.to} of
 		{undefined, _} ->
 			send(State, "503 Error: need MAIL command\r\n"),
@@ -616,8 +574,15 @@ handle_request({<<"DATA">>, <<>>}, #state{envelope = Envelope} = State) ->
 		_Else ->
 			send(State, "354 enter mail, end with line containing only '.'\r\n"),
 			%io:format("switching to data read mode~n", []),
-
-			{ok, State#state{readmessage = true}}
+			MaxSize = case has_extension(Extensions, "SIZE") of
+				{true, Value} ->
+					list_to_integer(Value);
+				false ->
+					?MAXIMUMSIZE
+			end,
+			%% Enter "readmessage" mode
+			setopts(State, [{packet, raw}]),
+			{ok, State#state{readmessage = {MaxSize, <<>>}}}
 	end;
 handle_request({<<"RSET">>, _Any}, #state{envelope = Envelope, module = Module, callbackstate = OldCallbackState} = State) ->
 	send(State, "250 Ok\r\n"),
@@ -795,75 +760,64 @@ try_auth(AuthType, Username, Credential, #state{module = Module, envelope = Enve
 	%B = [io_lib:format("~2.16.0b", [X]) || <<X>> <= erlang:md5(integer_to_list(rand:uniform(4294967295)))],
 	%binary_to_list(base64:encode(lists:flatten(A ++ B))).
 
+%% @doc Handle full DATA body
+handle_data_body(Body, #state{envelope = Env, module=Module, callbackstate = OldCallbackState,
+                         extensions = Extensions} = State) ->
+    UnescapedBody = re:replace(Body, <<"^\\\.">>, <<>>, [global, multiline, {return, binary}]),
+	Envelope = Env#envelope{data = UnescapedBody},% size = length(Body)},
+	Valid = case has_extension(Extensions, "SIZE") of
+		{true, Value} ->
+			case byte_size(Envelope#envelope.data) > list_to_integer(Value) of
+				true ->
+					send(State, "552 Message too large\r\n"),
+					false;
+				false ->
+					true
+			end;
+		false ->
+			true
+	end,
+	case Valid of
+		true ->
+			case Module:handle_DATA(Envelope#envelope.from, Envelope#envelope.to,
+                                    Envelope#envelope.data, OldCallbackState) of
+				{ok, Reference, CallbackState} ->
+					send(State, io_lib:format("250 queued as ~s\r\n", [Reference])),
+					State#state{callbackstate = CallbackState};
+				{error, Message, CallbackState} ->
+					send(State, [Message, "\r\n"]),
+					State#state{callbackstate = CallbackState}
+			end;
+		false ->
+			% might not even be able to get here anymore...
+			State
+	end.
 
-%% @doc a tight loop to receive the message body
-receive_data(_Acc, _Transport, _Socket, _, Size, MaxSize, Session, _Options) when MaxSize > 0, Size > MaxSize ->
-	io:format("message body size ~B exceeded maximum allowed ~B~n", [Size, MaxSize]),
-	Session ! {receive_data, {error, size_exceeded}};
-receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options) ->
-	case Transport:recv(Socket, RecvSize, 1000) of
-		{ok, Packet} when Acc == [] ->
-			case check_bare_crlf(Packet, <<>>, proplists:get_value(allow_bare_newlines, Options, false), 0) of
-				error ->
-					Session ! {receive_data, {error, bare_newline}};
-				FixedPacket ->
-					case binstr:strpos(FixedPacket, "\r\n.\r\n") of
-						0 ->
-							%io:format("received ~B bytes; size is now ~p~n", [RecvSize, Size + size(Packet)]),
-							%io:format("memory usage: ~p~n", [erlang:process_info(self(), memory)]),
-							receive_data([FixedPacket | Acc], Transport, Socket, RecvSize, Size + byte_size(FixedPacket), MaxSize, Session, Options);
-						Index ->
-							String = binstr:substr(FixedPacket, 1, Index - 1),
-							Rest = binstr:substr(FixedPacket, Index+5),
-							%io:format("memory usage before flattening: ~p~n", [erlang:process_info(self(), memory)]),
-							Result = list_to_binary(lists:reverse([String | Acc])),
-							%io:format("memory usage after flattening: ~p~n", [erlang:process_info(self(), memory)]),
-							Session ! {receive_data, Result, Rest}
-					end
-			end;
-		{ok, Packet} ->
-			[Last | _] = Acc,
-			case check_bare_crlf(Packet, Last, proplists:get_value(allow_bare_newlines, Options, false), 0) of
-				error ->
-					Session ! {receive_data, {error, bare_newline}};
-				FixedPacket ->
-					case binstr:strpos(FixedPacket, "\r\n.\r\n") of
-						0 ->
-							%io:format("received ~B bytes; size is now ~p~n", [RecvSize, Size + size(Packet)]),
-							%io:format("memory usage: ~p~n", [erlang:process_info(self(), memory)]),
-							receive_data([FixedPacket | Acc], Transport, Socket, RecvSize, Size + byte_size(FixedPacket), MaxSize, Session, Options);
-						Index ->
-							String = binstr:substr(FixedPacket, 1, Index - 1),
-							Rest = binstr:substr(FixedPacket, Index+5),
-							%io:format("memory usage before flattening: ~p~n", [erlang:process_info(self(), memory)]),
-							Result = list_to_binary(lists:reverse([String | Acc])),
-							%io:format("memory usage after flattening: ~p~n", [erlang:process_info(self(), memory)]),
-							Session ! {receive_data, Result, Rest}
-					end
-			end;
-		{error, timeout} when RecvSize =:= 0, length(Acc) > 1 ->
-			% check that we didn't accidentally receive a \r\n.\r\n split across 2 receives
-			[A, B | Acc2] = Acc,
-			Packet = list_to_binary([B, A]),
-			case binstr:strpos(Packet, "\r\n.\r\n") of
+%% @doc handle DATA network packet
+-spec handle_body_packet(binary(), binary(), non_neg_integer(), options()) ->
+								{error, size_exceeded | bare_newline}
+							  | {continue, binary()}
+							  | {done, binary(), binary()}.
+handle_body_packet(Packet, Acc, Limit, _Opts) when byte_size(Packet) + byte_size(Acc) > Limit ->
+	{error, size_exceeded};
+handle_body_packet(Packet, Acc, _Limit, Opts) ->
+	case check_bare_crlf(Packet, Acc, proplists:get_value(allow_bare_newlines, Opts, false), 0) of
+		error ->
+			{error, bare_newline};
+		FixedPacket ->
+			Acc1 = <<Acc/binary, FixedPacket/binary>>,
+			StartFrom = max(byte_size(Acc) - 4, % len of "\r\n.\r"
+							0),
+			case binstr:strpos(Acc1, <<"\r\n.\r\n">>, StartFrom) of
 				0 ->
-					% uh-oh
-					%io:format("no data on socket, and no DATA terminator, retrying ~p~n", [Session]),
-					% eventually we'll either get data or a different error, just keep retrying
-					receive_data(Acc, Transport, Socket, 0, Size, MaxSize, Session, Options);
+					%%io:format("received ~B bytes; size is now ~p~n", [RecvSize, Size + size(Packet)]),
+					%%io:format("memory usage: ~p~n", [erlang:process_info(self(), memory)]),
+					{continue, Acc1};
 				Index ->
-					String = binstr:substr(Packet, 1, Index - 1),
-					Rest = binstr:substr(Packet, Index+5),
-					%io:format("memory usage before flattening: ~p~n", [erlang:process_info(self(), memory)]),
-					Result = list_to_binary(lists:reverse([String | Acc2])),
-					%io:format("memory usage after flattening: ~p~n", [erlang:process_info(self(), memory)]),
-					Session ! {receive_data, Result, Rest}
-			end;
-		{error, timeout} ->
-			receive_data(Acc, Transport, Socket, 0, Size, MaxSize, Session, Options);
-		{error, Reason} ->
-			io:format("receive error: ~p~n", [Reason]),
-			exit(receive_error)
+					Data = binstr:substr(Acc1, 1, Index - 1),
+					Tail = binstr:substr(Acc1, Index + 5),
+					{done, Data, Tail}
+			end
 	end.
 
 check_for_bare_crlf(Bin, Offset) ->
@@ -2329,5 +2283,57 @@ stray_newline_test_() ->
 		}
 	].
 
+handle_body_packet_test_() ->
+	[
+		{"Size limits",
+			fun() ->
+					?assertEqual({error, size_exceeded},
+								 handle_body_packet(<<"foobar">>, <<>>, 3, [])),
+					?assertEqual({error, size_exceeded},
+								 handle_body_packet(<<"bar">>, <<"foo">>, 3, [])),
+					?assertEqual({continue, <<"foobar">>},
+								 handle_body_packet(<<"bar">>, <<"foo">>, 6, []))
+			end
+		},
+		{"Bare newlines",
+			fun() ->
+					?assertEqual({error, bare_newline},
+								 handle_body_packet(<<"foo\n">>, <<>>, 20, [])),
+					?assertEqual({error, bare_newline},
+								 handle_body_packet(<<"\nbar\r\n">>, <<"foo\r\n">>, 20, [])),
+					?assertEqual({error, bare_newline},
+								 handle_body_packet(<<"bar\n">>, <<"foo">>, 20, [])),
+					?assertEqual({error, bare_newline},
+								 handle_body_packet(<<"b\nar">>, <<"foo">>, 20, [])),
+
+					?assertEqual({continue, <<"foobar\r\n">>},
+								 handle_body_packet(<<"bar\n">>, <<"foo">>, 20,
+													[{allow_bare_newlines, fix}])),
+					?assertEqual({continue, <<"foo\r\n\r\nbar">>},
+								 handle_body_packet(<<"\nbar">>, <<"foo\r\n">>, 20,
+													[{allow_bare_newlines, fix}])),
+					?assertEqual({continue, <<"foobar">>},
+								 handle_body_packet(<<"bar\n">>, <<"foo">>, 20,
+													[{allow_bare_newlines, strip}])),
+					?assertEqual({continue, <<"foo\r\nbar">>},
+								 handle_body_packet(<<"\nbar">>, <<"foo\r\n">>, 20,
+													[{allow_bare_newlines, strip}]))
+			end
+		},
+		{"Done",
+			fun() ->
+					?assertEqual({done, <<"foo">>, <<"bar">>},
+								 handle_body_packet(<<"\r\n.\r\nbar">>, <<"foo">>, 20, [])),
+					?assertEqual({done, <<"foo">>, <<"bar">>},
+								 handle_body_packet(<<".\r\nbar">>, <<"foo\r\n">>, 20, [])),
+					?assertEqual({done, <<"foo">>, <<"bar">>},
+								 handle_body_packet(<<"\nbar">>, <<"foo\r\n.\r">>, 20, [])),
+					?assertEqual({done, <<"foo">>, <<>>},
+								 handle_body_packet(<<"foo\r\n.\r\n">>, <<>>, 20, [])),
+					?assertEqual({done, <<"foo">>, <<>>},
+								 handle_body_packet(<<"\n">>, <<"foo\r\n.\r">>, 20, []))
+			end
+		}
+	].
 
 -endif.
