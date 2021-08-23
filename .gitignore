@@ -2,6 +2,7 @@
 *.beam
 erl_crash.dump
 coverage/*
+doc/
 .DS_Store
 build
 *.xcodeproj
@@ -12,3 +13,4 @@ deps/
 _build
 .rebar
 compile_commands.json
+rebar3.crashdump

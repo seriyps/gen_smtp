@@ -45,17 +45,83 @@
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 -else.
 -export([send/2, send/3, send_blocking/2, open/1, deliver/2, close/1]).
 -endif.
 
--opaque smtp_client_socket() :: {smtp_socket:socket(), list(), list()}.
--export_type([smtp_client_socket/0]).
 
--type email() :: {string() | binary(), [string() | binary(), ...], string() | binary() | function()}.
+-export_type([smtp_client_socket/0,
+              email/0,
+              email_address/0,
+              options/0,
+              callback/0,
+              smtp_session_error/0,
+              host_failure/0,
+              failure/0,
+              validate_options_error/0]).
 
--spec send(Email :: email(), Options :: list()) -> {'ok', pid()} | {'error', any()}.
+-type email_address() :: string() | binary().
+-type email() :: {From :: email_address(),
+                  To :: [email_address(), ...],
+                  Body :: string() | binary() | fun( () -> string() | binary() )}.
+
+-type options() :: [{ssl, boolean()} |
+                    {tls, always | never | if_available} |
+                    {tls_options, list()} | % ssl:option() / ssl:tls_client_option()
+                    {sockopts, [gen_tcp:connect_option()]} |
+                    {port, inet:port_number()} |
+                    {timeout, timeout()} |
+                    {relay, inet:ip_address() | inet:hostname()} |
+                    {no_mx_lookups, boolean()} |
+                    {auth, always | never | if_available} |
+                    {hostname, string()} |
+                    {retries, non_neg_integer()} |
+                    {username, string()} |
+                    {password, string()} |
+                    {trace_fun, fun( (Fmt :: string(), Args :: [any()]) -> any() )}].
+
+-type extensions() :: [{binary(), binary()}].
+
+-record(smtp_client_socket, {
+		socket :: smtp_socket:socket(),
+		host :: string(),
+		extensions :: list(),
+		options :: list()
+	}).
+-opaque smtp_client_socket() :: #smtp_client_socket{}.
+
+-type callback() :: fun( ({exit, any()} |
+                          smtp_session_error() |
+                          {ok, binary()}) -> any() ).
+
+%% Smth that is thrown from inner SMTP functions
+-type permanent_failure_reason() :: binary() |  % server's 5xx response
+                                    auth_failed |
+                                    ssl_not_started.
+-type temporary_failure_reason() :: binary() |  %server's 4xx response
+                                    tls_failed.
+-type validate_options_error() :: no_relay |
+                                  invalid_port |
+                                  no_credentials.
+-type failure() :: {temporary_failure, temporary_failure_reason()} |
+                   {permanent_failure, permanent_failure_reason()} |
+                   {missing_requirement, auth | tls} |
+                   {unexpected_response, [binary()]} |
+                   {network_failure, {error, timeout | inet:posix()}}.
+-type smtp_host() :: inet:hostname().
+-type host_failure() ::
+        {temporary_failure, smtp_host(), temporary_failure_reason()} |
+        {permanent_failure, smtp_host(), permanent_failure_reason()} |
+        {missing_requirement, smtp_host(), auth | tls} |
+        {unexpected_response, smtp_host(), [binary()]} |
+        {network_failure, smtp_host(), {error, timeout | inet:posix()}}.
+-type smtp_session_error() ::
+        {error, no_more_hosts | send, {permanent_failure, smtp_host(), permanent_failure_reason()}} |
+        {error, retries_exceeded | send, host_failure()}.
+
+
+-spec send(Email :: email(), Options :: options()) -> {'ok', pid()} | {'error', validate_options_error()}.
 %% @doc Send an email in a non-blocking fashion via a spawned_linked process.
 %% The process will exit abnormally on a send failure.
 send(Email, Options) ->
@@ -64,7 +130,7 @@ send(Email, Options) ->
 %% @doc Send an email nonblocking and invoke a callback with the result of the send.
 %% The callback will receive either `{ok, Receipt}' where Receipt is the SMTP server's receipt
 %% identifier,  `{error, Type, Message}' or `{exit, ExitReason}', as the single argument.
--spec send(Email :: email(), Options :: list(), Callback :: function() | 'undefined') -> {'ok', pid()} | {'error', any()}.
+-spec send(Email :: email(), Options :: options(), Callback :: callback() | 'undefined') -> {'ok', pid()} | {'error', validate_options_error()}.
 send(Email, Options, Callback) ->
 	NewOptions = lists:ukeymerge(1, lists:sort(Options),
 		lists:sort(?DEFAULT_OPTIONS)),
@@ -96,7 +162,10 @@ send(Email, Options, Callback) ->
 			{error, Reason}
 	end.
 
--spec send_blocking(Email :: email(), Options :: list()) -> binary() | {'error', atom(), any()} | {'error', any()}.
+-spec send_blocking(Email :: email(), Options :: options()) ->
+                           binary() |
+                           smtp_session_error() |
+                           {error, validate_options_error()}.
 %% @doc Send an email and block waiting for the reply. Returns either a binary that contains
 %% the SMTP server's receipt or `{error, Type, Message}' or `{error, Reason}'.
 send_blocking(Email, Options) ->
@@ -109,7 +178,9 @@ send_blocking(Email, Options) ->
 			{error, Reason}
 	end.
 
--spec send_it_nonblock(Email :: email(), Options :: list(), Callback :: function() | 'undefined') ->{'ok', binary()} | {'error', any(), any()}.
+-spec send_it_nonblock(Email :: email(), Options :: options(), Callback :: callback() | 'undefined') ->
+                              {'ok', binary()} |
+                              smtp_session_error().
 send_it_nonblock(Email, Options, Callback) ->
 	case send_it(Email, Options) of
 		{error, Type, Message} when is_function(Callback) ->
@@ -124,7 +195,10 @@ send_it_nonblock(Email, Options, Callback) ->
 			{ok, Receipt}
 	end.
 
--spec open(Options :: list()) -> {ok, SocketDescriptor :: smtp_client_socket()} | {error, any()}.
+-spec open(Options :: options()) ->
+                  {ok, SocketDescriptor :: smtp_client_socket()} |
+                  smtp_session_error() |
+                  {error, bad_option, validate_options_error()}.
 %% @doc Open a SMTP client socket with the provided options
 %% Once the socket has been opened, you can use it with deliver/2.
 open(Options) ->
@@ -139,38 +213,42 @@ open(Options) ->
 										_ ->
 											smtp_util:mxlookup(RelayDomain)
 									end,
-			%io:format("MX records for ~s are ~p~n", [RelayDomain, MXRecords]),
+			trace(Options, "MX records for ~s are ~p~n", [RelayDomain, MXRecords]),
 			Hosts = case MXRecords of
 								[] ->
 									[{0, RelayDomain}]; % maybe we're supposed to relay to a host directly
 								_ ->
 									MXRecords
 							end,
-			case try_smtp_sessions(Hosts, NewOptions, []) of
-				{error, _, _} = Error -> Error;
-				SocketDescriptor -> {ok, SocketDescriptor}
-			end;
+			try_smtp_sessions(Hosts, NewOptions, []);
 		{error, Reason} ->
 			{error, bad_option, Reason}
 	end.
 
--spec deliver(Socket :: smtp_client_socket(), Email :: email()) -> {'ok', Receipt :: binary()} | {error, any()}.
+-spec deliver(Socket :: smtp_client_socket(), Email :: email()) -> {'ok', Receipt :: binary()} | {error, failure()}.
 %% @doc Deliver an email on an open smtp client socket.
 %% For use with a socket opened with open/1. The socket can be reused as long as the previous call to deliver/2 returned `{ok, Receipt}'.
-deliver({Socket, Extensions, Options}, Email) ->
-	try try_sending_it(Email, Socket, Extensions, Options) of
-		Receipt -> {ok, Receipt}
+deliver(#smtp_client_socket{} = SmtpClientSocket, Email) ->
+	#smtp_client_socket{
+		socket = Socket,
+		extensions = Extensions,
+		options = Options
+	} = SmtpClientSocket,
+	try
+		Receipt = try_sending_it(Email, Socket, Extensions, Options),
+		{ok, Receipt}
 	catch
 		throw:FailMsg ->
 			{error, FailMsg}
 	end.
 
--spec close(Socker:: smtp_client_socket()) -> ok.
+-spec close(Socket :: smtp_client_socket()) -> ok.
 %% @doc Close an open smtp client socket opened with open/1.
-close({Socket, _Extensions, _Options}) ->
+close(#smtp_client_socket{ socket = Socket }) ->
 	quit(Socket).
 
--spec send_it(Email :: email(), Options :: list()) -> binary() | {'error', any(), any()}.
+-spec send_it(Email :: email(), Options :: options()) -> binary() |
+                                                         smtp_session_error().
 send_it(Email, Options) ->
 	RelayDomain = to_string(proplists:get_value(relay, Options)),
 	MXRecords = case proplists:get_value(no_mx_lookups, Options) of
@@ -189,21 +267,37 @@ send_it(Email, Options) ->
 	case try_smtp_sessions(Hosts, Options, []) of
 		{error, _, _} = Error ->
 			Error;
-		{Socket, Extensions, Options1} ->
-			Receipt = try_sending_it(Email, Socket, Extensions, Options1),
-			quit(Socket),
-			Receipt
+		{ok, ClientSocket} ->
+			#smtp_client_socket{
+				socket = Socket,
+				host = Host,
+				extensions = Extensions,
+				options = Options1
+			} = ClientSocket,
+			try
+				Receipt = try_sending_it(Email, Socket, Extensions, Options1),
+				quit(Socket),
+				Receipt
+			catch
+				throw:{FailureType, Message} ->
+					{error, send, {FailureType, Host, Message}}
+			end
 	end.
 
--spec try_smtp_sessions(Hosts :: [{non_neg_integer(), string()}, ...], Options :: list(), RetryList :: list()) -> smtp_client_socket() | {'error', any(), any()}.
+-spec try_smtp_sessions(Hosts :: [{non_neg_integer(), string()}, ...], Options :: options(), RetryList :: list()) ->
+                               {ok, smtp_client_socket()} |
+                               smtp_session_error().
 try_smtp_sessions([{_Distance, Host} | _Tail] = Hosts, Options, RetryList) ->
-	try open_smtp_session(Host, Options) of
-		Res -> Res
+	try
+		{ok, open_smtp_session(Host, Options)}
 	catch
 		throw:FailMsg ->
 			handle_smtp_throw(FailMsg, Hosts, Options, RetryList)
 	end.
 
+-spec handle_smtp_throw(failure(), [{non_neg_integer(), smtp_host()}], options(), list()) ->
+                               {ok, smtp_client_socket()} |
+                               smtp_session_error().
 handle_smtp_throw({permanent_failure, Message}, [{_Distance, Host} | _Tail], _Options, _RetryList) ->
 	% permanent failure means no retries, and don't even continue with other hosts
 	{error, no_more_hosts, {permanent_failure, Host, Message}};
@@ -213,7 +307,7 @@ handle_smtp_throw({temporary_failure, tls_failed}, [{_Distance, Host} | _Tail] =
 		if_available ->
 			NoTLSOptions = [{tls,never} | proplists:delete(tls, Options)],
 			try open_smtp_session(Host, NoTLSOptions) of
-				Res -> Res
+				Res -> {ok, Res}
 			catch
 				throw:FailMsg ->
 					handle_smtp_throw(FailMsg, Hosts, Options, RetryList)
@@ -250,7 +344,7 @@ fetch_next_host(Retries, _RetryCount, [{Distance, Host} | Tail], RetryList, Opti
 	{Tail ++ [{Distance, Host}], lists:keydelete(Host, 1, RetryList) ++ [{Host, 1}]}.
 
 
--spec open_smtp_session(Host :: string(), Options :: list()) -> smtp_client_socket().
+-spec open_smtp_session(Host :: string(), Options :: options()) -> smtp_client_socket().
 open_smtp_session(Host, Options) ->
 	{ok, Socket, _Host2, Banner} = connect(Host, Options),
 	trace(Options, "connected to ~s; banner was ~s~n", [Host, Banner]),
@@ -260,20 +354,25 @@ open_smtp_session(Host, Options) ->
 	trace(Options, "Extensions are ~p~n", [Extensions2]),
 	Authed = try_AUTH(Socket2, Options, proplists:get_value(<<"AUTH">>, Extensions2)),
 	trace(Options, "Authentication status is ~p~n", [Authed]),
-	{Socket2, Extensions, Options}.
+	#smtp_client_socket{
+		socket = Socket2,
+		host = Host,
+		extensions = Extensions,
+		options = Options
+	}.
 
--spec try_sending_it(Email :: email(), Socket :: smtp_socket:socket(), Extensions :: list(), Options :: list()) -> binary().
+-spec try_sending_it(Email :: email(), Socket :: smtp_socket:socket(), Extensions :: extensions(), Options :: options()) -> binary().
 try_sending_it({From, To, Body}, Socket, Extensions, Options) ->
 	try_MAIL_FROM(From, Socket, Extensions, Options),
 	try_RCPT_TO(To, Socket, Extensions, Options),
 	try_DATA(Body, Socket, Extensions, Options).
 
--spec try_MAIL_FROM(From :: string() | binary(), Socket :: smtp_socket:socket(), Extensions :: list(), Options :: list()) -> true.
+-spec try_MAIL_FROM(From :: email_address(), Socket :: smtp_socket:socket(), Extensions :: extensions(), Options :: options()) -> true.
 try_MAIL_FROM(From, Socket, Extensions, Options) when is_binary(From) ->
 	try_MAIL_FROM(binary_to_list(From), Socket, Extensions, Options);
 try_MAIL_FROM("<" ++ _ = From, Socket, _Extensions, Options) ->
 	% TODO do we need to bother with SIZE?
-	smtp_socket:send(Socket, ["MAIL FROM: ", From, "\r\n"]),
+	smtp_socket:send(Socket, ["MAIL FROM:", From, "\r\n"]),
 	case read_possible_multiline_reply(Socket) of
 		{ok, <<"250", _Rest/binary>>} ->
 			true;
@@ -289,13 +388,13 @@ try_MAIL_FROM(From, Socket, Extension, Options) ->
 	% someone was bad and didn't put in the angle brackets
 	try_MAIL_FROM("<"++From++">", Socket, Extension, Options).
 
--spec try_RCPT_TO(Tos :: [binary() | string()], Socket :: smtp_socket:socket(), Extensions :: list(), Options :: list()) -> true.
+-spec try_RCPT_TO(Tos :: [email_address()], Socket :: smtp_socket:socket(), Extensions :: extensions(), Options :: options()) -> true.
 try_RCPT_TO([], _Socket, _Extensions, _Options) ->
 	true;
 try_RCPT_TO([To | Tail], Socket, Extensions, Options) when is_binary(To) ->
 	try_RCPT_TO([binary_to_list(To) | Tail], Socket, Extensions, Options);
 try_RCPT_TO(["<" ++ _ = To | Tail], Socket, Extensions, Options) ->
-	smtp_socket:send(Socket, ["RCPT TO: ",To,"\r\n"]),
+	smtp_socket:send(Socket, ["RCPT TO:",To,"\r\n"]),
 	case read_possible_multiline_reply(Socket) of
 		{ok, <<"250", _Rest/binary>>} ->
 			try_RCPT_TO(Tail, Socket, Extensions, Options);
@@ -312,7 +411,7 @@ try_RCPT_TO([To | Tail], Socket, Extensions, Options) ->
 	% someone was bad and didn't put in the angle brackets
 	try_RCPT_TO(["<"++To++">" | Tail], Socket, Extensions, Options).
 
--spec try_DATA(Body :: binary() | function(), Socket :: smtp_socket:socket(), Extensions :: list(), Options :: list()) -> binary().
+-spec try_DATA(Body :: binary() | function(), Socket :: smtp_socket:socket(), Extensions :: extensions(), Options :: options()) -> binary().
 try_DATA(Body, Socket, Extensions, Options) when is_function(Body) ->
 	try_DATA(Body(), Socket, Extensions, Options);
 try_DATA(Body, Socket, _Extensions, _Options) ->
@@ -340,7 +439,7 @@ try_DATA(Body, Socket, _Extensions, _Options) ->
 			throw({permanent_failure, Msg})
 	end.
 
--spec try_AUTH(Socket :: smtp_socket:socket(), Options :: list(), AuthTypes :: [string()]) -> boolean().
+-spec try_AUTH(Socket :: smtp_socket:socket(), Options :: options(), AuthTypes :: [string()]) -> boolean().
 try_AUTH(Socket, Options, []) ->
 	case proplists:get_value(auth, Options) of
 		always ->
@@ -395,7 +494,7 @@ to_string(Binary) when is_binary(Binary) -> binary_to_list(Binary).
 to_binary(String) when is_binary(String)   -> String;
 to_binary(String) when is_list(String) -> list_to_binary(String).
 
--spec do_AUTH(Socket :: smtp_socket:socket(), Username :: binary(), Password :: binary(), Types :: [string()], Options :: list()) -> boolean().
+-spec do_AUTH(Socket :: smtp_socket:socket(), Username :: binary(), Password :: binary(), Types :: [string()], Options :: options()) -> boolean().
 do_AUTH(Socket, Username, Password, Types, Options) ->
 	FixedTypes = [string:to_upper(X) || X <- Types],
 	trace(Options, "Fixed types: ~p~n", [FixedTypes]),
@@ -403,7 +502,7 @@ do_AUTH(Socket, Username, Password, Types, Options) ->
 	trace(Options, "available authentication types, in order of preference: ~p~n", [AllowedTypes]),
 	do_AUTH_each(Socket, Username, Password, AllowedTypes, Options).
 
--spec do_AUTH_each(Socket :: smtp_socket:socket(), Username :: binary(), Password :: binary(), AuthTypes :: [string()], Options :: list()) -> boolean().
+-spec do_AUTH_each(Socket :: smtp_socket:socket(), Username :: binary(), Password :: binary(), AuthTypes :: [string()], Options :: options()) -> boolean().
 do_AUTH_each(_Socket, _Username, _Password, [], _Options) ->
 	false;
 do_AUTH_each(Socket, Username, Password, ["CRAM-MD5" | Tail], Options) ->
@@ -438,15 +537,17 @@ do_AUTH_each(Socket, Username, Password, ["XOAUTH2" | Tail], Options) ->
 	end;
 do_AUTH_each(Socket, Username, Password, ["LOGIN" | Tail], Options) ->
 	smtp_socket:send(Socket, "AUTH LOGIN\r\n"),
-	case read_possible_multiline_reply(Socket) of
-		%% base64 Username: or username:
-		{ok, Prompt} when Prompt == <<"334 VXNlcm5hbWU6\r\n">>; Prompt == <<"334 dXNlcm5hbWU6\r\n">> ->
+	{ok, Prompt} = read_possible_multiline_reply(Socket),
+    case is_auth_username_prompt(Prompt) of
+        true ->
+    		%% base64 Username: or username:
 			trace(Options, "username prompt~n", []),
 			U = base64:encode(Username),
 			smtp_socket:send(Socket, [U,"\r\n"]),
-			case read_possible_multiline_reply(Socket) of
-				%% base64 Password: or password:
-				{ok, Prompt2} when Prompt2 == <<"334 UGFzc3dvcmQ6\r\n">>; Prompt2 == <<"334 cGFzc3dvcmQ6\r\n">> ->
+			{ok, Prompt2} = read_possible_multiline_reply(Socket),
+            case is_auth_password_prompt(Prompt2) of
+                true ->
+    				%% base64 Password: or password:
 					trace(Options, "password prompt~n", []),
 					P = base64:encode(Password),
 					smtp_socket:send(Socket, [P,"\r\n"]),
@@ -458,12 +559,12 @@ do_AUTH_each(Socket, Username, Password, ["LOGIN" | Tail], Options) ->
 							trace(Options, "password rejected: ~s", [Msg]),
 							do_AUTH_each(Socket, Username, Password, Tail, Options)
 					end;
-				{ok, Msg2} ->
-					trace(Options, "username rejected: ~s", [Msg2]),
+				false ->
+					trace(Options, "username rejected: ~s", [Prompt2]),
 					do_AUTH_each(Socket, Username, Password, Tail, Options)
 			end;
-		{ok, Something} ->
-			trace(Options, "got ~s~n", [Something]),
+		false ->
+			trace(Options, "got ~s~n", [Prompt]),
 			do_AUTH_each(Socket, Username, Password, Tail, Options)
 	end;
 do_AUTH_each(Socket, Username, Password, ["PLAIN" | Tail], Options) ->
@@ -482,7 +583,21 @@ do_AUTH_each(Socket, Username, Password, [Type | Tail], Options) ->
 	trace(Options, "unsupported AUTH type ~s~n", [Type]),
 	do_AUTH_each(Socket, Username, Password, Tail, Options).
 
--spec try_EHLO(Socket :: smtp_socket:socket(), Options :: list()) -> {ok, list()}.
+
+is_auth_username_prompt(<<"334 VXNlcm5hbWU6\r\n">>) -> true;
+is_auth_username_prompt(<<"334 dXNlcm5hbWU6\r\n">>) -> true;
+is_auth_username_prompt(<<"334 VXNlcm5hbWU6 ", _/binary>>) -> true;
+is_auth_username_prompt(<<"334 dXNlcm5hbWU6 ", _/binary>>) -> true;
+is_auth_username_prompt(_) -> false.
+
+is_auth_password_prompt(<<"334 UGFzc3dvcmQ6\r\n">>) -> true;
+is_auth_password_prompt(<<"334 cGFzc3dvcmQ6\r\n">>) -> true;
+is_auth_password_prompt(<<"334 UGFzc3dvcmQ6 ", _/binary>>) -> true;
+is_auth_password_prompt(<<"334 cGFzc3dvcmQ6 ", _/binary>>) -> true;
+is_auth_password_prompt(_) -> false.
+
+
+-spec try_EHLO(Socket :: smtp_socket:socket(), Options :: options()) -> {ok, extensions()}.
 try_EHLO(Socket, Options) ->
 	ok = smtp_socket:send(Socket, ["EHLO ", proplists:get_value(hostname, Options, smtp_util:guess_FQDN()), "\r\n"]),
 	case read_possible_multiline_reply(Socket) of
@@ -496,7 +611,7 @@ try_EHLO(Socket, Options) ->
 			{ok, parse_extensions(Reply, Options)}
 	end.
 
--spec try_HELO(Socket :: smtp_socket:socket(), Options :: list()) -> {ok, list()}.
+-spec try_HELO(Socket :: smtp_socket:socket(), Options :: options()) -> {ok, list()}.
 try_HELO(Socket, Options) ->
 	ok = smtp_socket:send(Socket, ["HELO ", proplists:get_value(hostname, Options, smtp_util:guess_FQDN()), "\r\n"]),
 	case read_possible_multiline_reply(Socket) of
@@ -511,7 +626,7 @@ try_HELO(Socket, Options) ->
 	end.
 
 % check if we should try to do TLS
--spec try_STARTTLS(Socket :: smtp_socket:socket(), Options :: list(), Extensions :: list()) -> {smtp_socket:socket(), list()}.
+-spec try_STARTTLS(Socket :: smtp_socket:socket(), Options :: options(), Extensions :: extensions()) -> {smtp_socket:socket(), extensions()}.
 try_STARTTLS(Socket, Options, Extensions) ->
 	case {proplists:get_value(tls, Options),
 			proplists:get_value(<<"STARTTLS">>, Extensions)} of
@@ -538,12 +653,12 @@ try_STARTTLS(Socket, Options, Extensions) ->
 	end.
 
 %% attempt to upgrade socket to TLS
--spec do_STARTTLS(Socket :: smtp_socket:socket(), Options :: list()) -> {smtp_socket:socket(), list()} | false.
+-spec do_STARTTLS(Socket :: smtp_socket:socket(), Options :: options()) -> {smtp_socket:socket(), extensions()} | false.
 do_STARTTLS(Socket, Options) ->
 	smtp_socket:send(Socket, "STARTTLS\r\n"),
 	case read_possible_multiline_reply(Socket) of
 		{ok, <<"220", _Rest/binary>>} ->
-			case catch smtp_socket:to_ssl_client(Socket, proplists:get_value(tls_options, Options, []), 5000) of
+			case catch smtp_socket:to_ssl_client(Socket, [binary | proplists:get_value(tls_options, Options, [])], 5000) of
 				{ok, NewSocket} ->
 					%NewSocket;
 					{ok, Extensions} = try_EHLO(NewSocket, Options),
@@ -680,7 +795,7 @@ check_option({auth, always}, Options) ->
 	end;
 check_option({auth, _}, _Options) -> ok.
 
--spec parse_extensions(Reply :: binary(), Options :: list()) -> [{binary(), binary()}].
+-spec parse_extensions(Reply :: binary(), Options :: options()) -> extensions().
 parse_extensions(Reply, Options) ->
 	[_ | Reply2] = re:split(Reply, "\r\n", [{return, binary}, trim]),
 	[
@@ -835,9 +950,9 @@ session_start_test_() ->
 								smtp_socket:send(X, "500 5.3.3 Unrecognized command\r\n"),
 								?assertMatch({ok, "HELO testing\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 Some banner\r\n"),
-								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 ok\r\n"),
-								?assertMatch({ok, "RCPT TO: <foo@bar.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "RCPT TO:<foo@bar.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 ok\r\n"),
 								?assertMatch({ok, "DATA\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "354 ok\r\n"),
@@ -858,9 +973,9 @@ session_start_test_() ->
 								smtp_socket:send(X, "220 Some banner\r\n"),
 								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 hostname\r\n"),
-								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 ok\r\n"),
-								?assertMatch({ok, "RCPT TO: <foo@bar.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "RCPT TO:<foo@bar.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 ok\r\n"),
 								?assertMatch({ok, "DATA\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "354 ok\r\n"),
@@ -881,9 +996,9 @@ session_start_test_() ->
 								smtp_socket:send(X, "220 Some banner\r\n"),
 								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 hostname\r\n"),
-								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 ok\r\n"),
-								?assertMatch({ok, "RCPT TO: <foo@bar.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "RCPT TO:<foo@bar.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 ok\r\n"),
 								?assertMatch({ok, "DATA\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "354 ok\r\n"),
@@ -904,9 +1019,9 @@ session_start_test_() ->
 								smtp_socket:send(X, "220 Some banner\r\n"),
 								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 hostname\r\n"),
-								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 ok\r\n"),
-								?assertMatch({ok, "RCPT TO: <foo@bar.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "RCPT TO:<foo@bar.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 ok\r\n"),
 								?assertMatch({ok, "DATA\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "354 ok\r\n"),
@@ -928,14 +1043,15 @@ session_start_test_() ->
 								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250-hostname\r\n250 STARTTLS\r\n"),
 								?assertMatch({ok, "STARTTLS\r\n"}, smtp_socket:recv(X, 0, 1000)),
-								gen_smtp_application:ensure_all_started(gen_smtp),
+								application:ensure_all_started(gen_smtp),
 								smtp_socket:send(X, "220 ok\r\n"),
-								{ok, Y} = smtp_socket:to_ssl_server(X, [{certfile, "test/fixtures/server.crt"}, {keyfile, "test/fixtures/server.key"}], 5000),
+								{ok, Y} = smtp_socket:to_ssl_server(X, [{certfile, "test/fixtures/mx1.example.com-server.crt"},
+																		{keyfile, "test/fixtures/mx1.example.com-server.key"}], 5000),
 								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(Y, 0, 1000)),
 								smtp_socket:send(Y, "250-hostname\r\n250 STARTTLS\r\n"),
-								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
 								smtp_socket:send(Y, "250 ok\r\n"),
-								?assertMatch({ok, "RCPT TO: <foo@bar.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								?assertMatch({ok, "RCPT TO:<foo@bar.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
 								smtp_socket:send(Y, "250 ok\r\n"),
 								?assertMatch({ok, "DATA\r\n"}, smtp_socket:recv(Y, 0, 1000)),
 								smtp_socket:send(Y, "354 ok\r\n"),
@@ -957,14 +1073,49 @@ session_start_test_() ->
 								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250-hostname\r\n250 STARTTLS\r\n"),
 								?assertMatch({ok, "STARTTLS\r\n"}, smtp_socket:recv(X, 0, 1000)),
-								gen_smtp_application:ensure_all_started(gen_smtp),
+								application:ensure_all_started(gen_smtp),
 								smtp_socket:send(X, "220 ok\r\n"),
-								{ok, Y} = smtp_socket:to_ssl_server(X, [{certfile, "test/fixtures/server.crt"}, {keyfile, "test/fixtures/server.key"}], 5000),
+								{ok, Y} = smtp_socket:to_ssl_server(X, [{certfile, "test/fixtures/mx1.example.com-server.crt"},
+																		{keyfile, "test/fixtures/mx1.example.com-server.key"}], 5000),
 								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(Y, 0, 1000)),
 								smtp_socket:send(Y, "250-hostname\r\n250 STARTTLS\r\n"),
-								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
 								smtp_socket:send(Y, "250 ok\r\n"),
-								?assertMatch({ok, "RCPT TO: <foo@bar.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								?assertMatch({ok, "RCPT TO:<foo@bar.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								smtp_socket:send(Y, "250 ok\r\n"),
+								?assertMatch({ok, "DATA\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								smtp_socket:send(Y, "354 ok\r\n"),
+								?assertMatch({ok, "hello world\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								?assertMatch({ok, ".\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								smtp_socket:send(Y, "250 ok\r\n"),
+								?assertMatch({ok, "QUIT\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								ok
+						end
+					}
+			end,
+			fun({ListenSock}) ->
+					{"Transaction with TLS advertised, but broken, should be restarted without TLS, if allowed",
+						fun() ->
+								Options = [{relay, "localhost"}, {port, 9876}, {hostname, <<"testing">>}, {tls, if_available}],
+								{ok, _Pid} = send({<<"test@foo.com">>, [<<"foo@bar.com">>], <<"hello world">>}, Options),
+								{ok, X} = smtp_socket:accept(ListenSock, 1000),
+								smtp_socket:send(X, "220 Some banner\r\n"),
+								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								smtp_socket:send(X, "250-hostname\r\n250 STARTTLS\r\n"),
+								?assertMatch({ok, "STARTTLS\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								smtp_socket:send(X, "220 ok\r\n"),
+								%% Now, send some invalid data instead of TLS handshake and close the socket
+								{ok, [22, V1, V2 | _]} = smtp_socket:recv(X, 0, 1000),
+								smtp_socket:send(X, [22, V1, V2, 0, 0]),
+								smtp_socket:close(X),
+								%% Client would make another attempt to connect, without TLS
+								{ok, Y} = smtp_socket:accept(ListenSock, 1000),
+								smtp_socket:send(Y, "220 Some banner\r\n"),
+								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								smtp_socket:send(Y, "250-hostname\r\n250 STARTTLS\r\n"),
+								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
+								smtp_socket:send(Y, "250 ok\r\n"),
+								?assertMatch({ok, "RCPT TO:<foo@bar.com>\r\n"}, smtp_socket:recv(Y, 0, 1000)),
 								smtp_socket:send(Y, "250 ok\r\n"),
 								?assertMatch({ok, "DATA\r\n"}, smtp_socket:recv(Y, 0, 1000)),
 								smtp_socket:send(Y, "354 ok\r\n"),
@@ -990,7 +1141,7 @@ session_start_test_() ->
 								AuthPacket = "AUTH PLAIN "++AuthString++"\r\n",
 								?assertEqual({ok, AuthPacket}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "235 ok\r\n"),
-								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								ok
 						end
 					}
@@ -1012,7 +1163,7 @@ session_start_test_() ->
 								PassString = binary_to_list(base64:encode("pass")),
 								?assertEqual({ok, PassString++"\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "235 ok\r\n"),
-								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								ok
 						end
 					}
@@ -1034,11 +1185,33 @@ session_start_test_() ->
 								PassString = binary_to_list(base64:encode("pass")),
 								?assertEqual({ok, PassString++"\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "235 ok\r\n"),
-								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								ok
 						end
 					}
 			end,
+            fun({ListenSock}) ->
+                    {"AUTH LOGIN should work with appended methods",
+                        fun() ->
+                                Options = [{relay, "localhost"}, {port, 9876}, {hostname, "testing"}, {username, "user"}, {password, "pass"}],
+                                {ok, _Pid} = send({"test@foo.com", ["foo@bar.com"], "hello world"}, Options),
+                                {ok, X} = smtp_socket:accept(ListenSock, 1000),
+                                smtp_socket:send(X, "220 Some banner\r\n"),
+                                ?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(X, 0, 1000)),
+                                smtp_socket:send(X, "250-hostname\r\n250 AUTH LOGIN\r\n"),
+                                ?assertEqual({ok, "AUTH LOGIN\r\n"}, smtp_socket:recv(X, 0, 1000)),
+                                smtp_socket:send(X, "334 VXNlcm5hbWU6 R6S4yT8pcW5sQjZD3CW61N0 - hssmtp\r\n"),
+                                UserString = binary_to_list(base64:encode("user")),
+                                ?assertEqual({ok, UserString++"\r\n"}, smtp_socket:recv(X, 0, 1000)),
+                                smtp_socket:send(X, "334 UGFzc3dvcmQ6 R6S4yT8pcW5sQjZD3CW61N0 - hssmtp\r\n"),
+                                PassString = binary_to_list(base64:encode("pass")),
+                                ?assertEqual({ok, PassString++"\r\n"}, smtp_socket:recv(X, 0, 1000)),
+                                smtp_socket:send(X, "235 ok\r\n"),
+                                ?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+                                ok
+                        end
+                    }
+            end,
 			fun({ListenSock}) ->
 					{"AUTH CRAM-MD5 should work",
 						fun() ->
@@ -1058,7 +1231,7 @@ session_start_test_() ->
 								CramDigest = smtp_util:trim_crlf(Packet),
 								?assertEqual(String, CramDigest),
 								smtp_socket:send(X, "235 ok\r\n"),
-								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								ok
 						end
 					}
@@ -1082,7 +1255,7 @@ session_start_test_() ->
 								CramDigest = smtp_util:trim_crlf(Packet),
 								?assertEqual(String, CramDigest),
 								smtp_socket:send(X, "235 ok\r\n"),
-								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								ok
 						end
 					}
@@ -1124,19 +1297,20 @@ session_start_test_() ->
 			fun({_ListenSock}) ->
 					{"Connecting to a SSL socket directly should work",
 						fun() ->
-								gen_smtp_application:ensure_all_started(gen_smtp),
-								{ok, ListenSock} = smtp_socket:listen(ssl, 9877, [{certfile, "test/fixtures/server.crt"}, {keyfile, "test/fixtures/server.key"}]),
+								application:ensure_all_started(gen_smtp),
+								{ok, ListenSock} = smtp_socket:listen(ssl, 9877, [{certfile, "test/fixtures/mx1.example.com-server.crt"},
+																				  {keyfile, "test/fixtures/mx1.example.com-server.key"}]),
 								Options = [{relay, <<"localhost">>}, {port, 9877}, {hostname, <<"testing">>}, {ssl, true}],
 								{ok, _Pid} = send({<<"test@foo.com">>, [<<"<foo@bar.com>">>, <<"baz@bar.com">>], <<"hello world">>}, Options),
 								{ok, X} = smtp_socket:accept(ListenSock, 1000),
 								smtp_socket:send(X, "220 Some banner\r\n"),
 								?assertMatch({ok, "EHLO testing\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250-hostname\r\n250 AUTH CRAM-MD5\r\n"),
-								?assertEqual({ok, "MAIL FROM: <test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertEqual({ok, "MAIL FROM:<test@foo.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 ok\r\n"),
-								?assertMatch({ok, "RCPT TO: <foo@bar.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "RCPT TO:<foo@bar.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 ok\r\n"),
-								?assertMatch({ok, "RCPT TO: <baz@bar.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
+								?assertMatch({ok, "RCPT TO:<baz@bar.com>\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "250 ok\r\n"),
 								?assertMatch({ok, "DATA\r\n"}, smtp_socket:recv(X, 0, 1000)),
 								smtp_socket:send(X, "354 ok\r\n"),
@@ -1147,6 +1321,19 @@ session_start_test_() ->
 								smtp_socket:close(ListenSock),
 								ok
 						end
+					},
+
+					{"Erlang 23.2.7 compatibility",
+					 fun() ->
+							 Receipt = gen_smtp_client:send_blocking({<<"Info.ContactTracing@sg.ch">>, [<<"maennchen@joshmartin.ch">>], <<"test">>},
+																	 [{relay, <<"joshmartin.ch">>},
+																	  {port, 25},
+																	  {hostname, "smtp.covid19-tracing.ch"},
+																	  {retries, 10}]
+																	),
+							 ?assertMatch({error, send, _}, Receipt),
+							 ok
+					 end
 					}
 			end
 

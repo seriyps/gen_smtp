@@ -21,7 +21,7 @@
 %%% SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 %% @doc A module for decoding/encoding MIME 1.0 email.
-%% The encoder and decoder operate on the same datastructure, which is as follows:
+%% The encoder and decoder operate on the same data structure, which is as follows:
 %% A 5-tuple with the following elements: `{Type, SubType, Headers, Parameters, Body}'.
 %%
 %% `Type' and `SubType' are the MIME type of the email, examples are `text/plain' or
@@ -45,7 +45,7 @@
 %% For a simple email, the body will usually be a binary consisting of the message body, In the
 %% case of a multipart email, its a list of these 5-tuple MIME structures. The third possibility,
 %% in the case of a message/rfc822 attachment, body can be a single 5-tuple MIME structure.
-%% 
+%%
 %% You should see the relevant RFCs (2045, 2046, 2047, etc.) for more information.
 
 -module(mimemail).
@@ -56,6 +56,17 @@
 -endif.
 
 -export([encode/1, encode/2, decode/2, decode/1, get_header_value/2, get_header_value/3, parse_headers/1]).
+-export([encode_quoted_printable/1, decode_quoted_printable/1]).
+
+-export_type([mimetuple/0,
+              mime_type/0,
+              mime_subtype/0,
+              headers/0,
+              parameters/0,
+              options/0,
+              dkim_options/0]).
+
+-include_lib("hut/include/hut.hrl").
 
 -define(DEFAULT_MIME_VERSION, <<"1.0">>).
 
@@ -66,9 +77,40 @@
 		{default_mime_version, ?DEFAULT_MIME_VERSION} % default mime version
 	]).
 
--type(mimetuple() :: {binary(), binary(), [{binary(), binary()}], [{binary(), binary() | [{binary(), binary()}]}], binary() | [{binary(), binary(), [{binary(), binary()}], [{binary(), binary()}], binary() | [tuple()]}] | tuple()}).
+-type mime_type() :: binary().                  % `<<"text">>'
+-type mime_subtype() :: binary().               % `<<"plain">>'
+-type headers() :: [{binary(), binary()}].      % `[{<<"Content-Type">>, <<"text/plain">>}]'
+-type parameters() ::
+        #{transfer_encoding => binary(),
+          %% [{<<"charset">>, <<"utf-8">>} | {<<"boundary">>, binary()} | {<<"name">>, binary()} etc...]
+          content_type_params => [{binary(), binary()}],
+          %% <<"inline">> | <<"attachment">> etc...
+          disposition => binary(),
+          %% [{<<"filename">>, binary()}, ]
+          disposition_params => [{binary(), binary()}]}.
 
--type(options() :: [{'encoding', binary()} | {'decode_attachment', boolean()} | {'dkim', [{atom(), any()}]}]).
+-type mimetuple() :: {
+                 mime_type(),
+                 mime_subtype(),
+                 headers(),
+                 parameters(),
+                 Body :: binary() | mimetuple() | [mimetuple()]
+                }.
+
+-type dkim_priv_key() :: {pem_plain, binary()} |
+                         {pem_encrypted, Key::binary(), Passwd::string()}.
+-type dkim_options() :: [{h, [binary()]} |
+                         {d, binary()} |
+                         {s, binary()} |
+                         {t, now | calendar:datetime()} |
+                         {x, calendar:datetime()} |
+                         {c, {simple | relaxed, simple | relaxed}} |
+                         {private_key, dkim_priv_key()}].
+-type options() :: [{encoding, binary()} |
+                    {decode_attachment, boolean()} |
+                    {dkim, dkim_options()} |
+                    {allow_missing_version, boolean()} |
+                    {default_mime_version, binary()}].
 
 -spec decode(Email :: binary()) -> mimetuple().
 %% @doc Decode a MIME email from a binary.
@@ -83,7 +125,7 @@ decode(All, Options) when is_binary(All), is_list(Options) ->
 	decode(Headers, Body, Options).
 
 decode(OrigHeaders, Body, Options) ->
-	%io:format("headers: ~p~n", [Headers]),
+	?log(debug, "headers: ~p~n", [OrigHeaders]),
 	Encoding = proplists:get_value(encoding, Options, none),
 	%FixedHeaders = fix_headers(Headers),
 	Headers = decode_headers(OrigHeaders, [], Encoding),
@@ -101,7 +143,9 @@ decode(OrigHeaders, Body, Options) ->
 						Body, proplists:get_value(<<"charset">>, Parameters), Encoding),
 					{Type, SubType, Headers, Parameters, NewBody};
 				undefined ->
-					Parameters = [{<<"content-type-params">>, [{<<"charset">>, <<"us-ascii">>}]}, {<<"disposition">>, <<"inline">>}, {<<"disposition-params">>, []}],
+					Parameters = #{content_type_params =>  [{<<"charset">>, <<"us-ascii">>}],
+                                   disposition => <<"inline">>,
+                                   disposition_params => []},
 					{<<"text">>, <<"plain">>, Headers, Parameters, decode_body(get_header_value(<<"Content-Transfer-Encoding">>, Headers), Body)}
 			end;
 		Other ->
@@ -128,7 +172,7 @@ encode({Type, Subtype, Headers, ContentTypeParams, Parts}, Options) ->
 					"\r\n\r\n",
 					EncodedBody]);
 encode(_, _) ->
-	io:format("Not a mime-decoded DATA~n"),
+	?log(debug, "Not a mime-decoded DATA~n"),
 	erlang:error(non_mime).
 
 
@@ -143,15 +187,15 @@ decode_header(Value, Charset) ->
 	RTokens = tokenize_header(Value, []),
 	Tokens = lists:reverse(RTokens),
 	Decoded = try decode_header_tokens_strict(Tokens, Charset)
-			  catch Type:Reason ->
-					  case decode_header_tokens_permissive(Tokens, Charset, []) of
-						  {ok, Dec} -> Dec;
-						  error ->
-							  % re-throw original error
-							  % may also use erlang:raise/3 to preserve original traceback
-							  erlang:Type(Reason)
-					  end
-			  end,
+		catch Type:Reason ->
+			case decode_header_tokens_permissive(Tokens, Charset, []) of
+				{ok, Dec} -> Dec;
+				error ->
+					% re-throw original error
+					% may also use erlang:raise/3 to preserve original traceback
+					erlang:Type(Reason)
+			end
+		end,
 	iolist_to_binary(Decoded).
 
 -type hdr_token() :: binary() | {Encoding::binary(), Data::binary()}.
@@ -183,8 +227,6 @@ tokenize_header(Value, Acc) ->
 					<<"b">> ->
 						decode_base64(re:replace(Data, "_", " ", [{return, binary}, global]))
 				end,
-
-			%% iconv:close(CD),
 
 
 			Offset = case re:run(binstr:substr(Value, AllStart + AllLen + 1), "^([\s\t\n\r]+)=\\?[-A-Za-z0-9_]+\\?[^\s]\\?[^\s]+\\?=", [ungreedy]) of
@@ -223,12 +265,8 @@ decode_header_tokens_permissive([], _, Stack) ->
 	end;
 decode_header_tokens_permissive([{Enc, Data} | Tokens], Charset, [{Enc, PrevData} | Stack]) ->
 	NewData = iolist_to_binary([PrevData, Data]),
-	case convert(Charset, Enc, NewData) of
-		{ok, S} ->
-			decode_header_tokens_permissive(Tokens, Charset, [S | Stack]);
-		_ ->
-			decode_header_tokens_permissive(Tokens, Charset, [{Enc, NewData} | Stack])
-	end;
+	{ok, S} = convert(Charset, Enc, NewData),
+	decode_header_tokens_permissive(Tokens, Charset, [S | Stack]);
 decode_header_tokens_permissive([NextToken | _] = Tokens, Charset, [{_, _} | Stack])
   when is_binary(NextToken) orelse is_tuple(NextToken) ->
 	%% practicaly very rare case "=?utf-8?Q?BROKEN?=\r\n\t=?windows-1251?Q?maybe-broken?="
@@ -243,13 +281,8 @@ decode_header_tokens_permissive([Data | Tokens], Charset, Stack) ->
 convert(_To, <<"x-binaryenc">>, Data) ->
     {ok, Data};
 convert(To, From, Data) ->
-	CD = case iconv:open(To, From) of
-			 {ok, Res} -> Res;
-			 {error, einval} -> throw({bad_charset, From})
-		 end,
-	Converted = iconv:conv(CD, Data),
-	iconv:close(CD),
-	Converted.
+	Result = iconv:convert(From, To, Data),
+	{ok, Result}.
 
 
 decode_component(Headers, Body, MimeVsn = <<"1.0", _/binary>>, Options) ->
@@ -267,22 +300,30 @@ decode_component(Headers, Body, MimeVsn = <<"1.0", _/binary>>, Options) ->
 				undefined ->
 					erlang:error(no_boundary);
 				Boundary ->
-					% io:format("this is a multipart email of type:  ~s and boundary ~s~n", [SubType, Boundary]),
-					Parameters2 = [{<<"content-type-params">>, Parameters}, {<<"disposition">>, Disposition}, {<<"disposition-params">>, DispositionParams}],
+					?log(debug, "this is a multipart email of type:  ~s and boundary ~s~n", [SubType, Boundary]),
+					Parameters2 = #{content_type_params => Parameters,
+                                    disposition => Disposition,
+                                    disposition_params => DispositionParams},
 					{<<"multipart">>, SubType, Headers, Parameters2, split_body_by_boundary(Body, list_to_binary(["--", Boundary]), MimeVsn, Options)}
 			end;
 		{<<"message">>, <<"rfc822">>, Parameters} ->
 			{NewHeaders, NewBody} = parse_headers(Body),
-			Parameters2 = [{<<"content-type-params">>, Parameters}, {<<"disposition">>, Disposition}, {<<"disposition-params">>, DispositionParams}],
+			Parameters2 = #{content_type_params => Parameters,
+                            disposition => Disposition,
+                            disposition_params => DispositionParams},
 			{<<"message">>, <<"rfc822">>, Headers, Parameters2, decode(NewHeaders, NewBody, Options)};
 		{Type, SubType, Parameters} ->
-			%io:format("body is ~s/~s~n", [Type, SubType]),
-			Parameters2 = [{<<"content-type-params">>, Parameters}, {<<"disposition">>, Disposition}, {<<"disposition-params">>, DispositionParams}],
+			?log(debug, "body is ~s/~s~n", [Type, SubType]),
+			Parameters2 = #{content_type_params => Parameters,
+                            disposition => Disposition,
+                            disposition_params => DispositionParams},
 			{Type, SubType, Headers, Parameters2, decode_body(get_header_value(<<"Content-Transfer-Encoding">>, Headers), Body, proplists:get_value(<<"charset">>, Parameters), proplists:get_value(encoding, Options, none))};
 		undefined -> % defaults
 			Type = <<"text">>,
 			SubType = <<"plain">>,
-			Parameters = [{<<"content-type-params">>, [{<<"charset">>, <<"us-ascii">>}]}, {<<"disposition">>, Disposition}, {<<"disposition-params">>, DispositionParams}],
+			Parameters = #{content_type_params => [{<<"charset">>, <<"us-ascii">>}],
+                           disposition => Disposition,
+                           disposition_params => DispositionParams},
 			{Type, SubType, Headers, Parameters, decode_body(get_header_value(<<"Content-Transfer-Encoding">>, Headers), Body)}
 	end;
 decode_component(_Headers, _Body, Other, _Options) ->
@@ -291,7 +332,7 @@ decode_component(_Headers, _Body, Other, _Options) ->
 -spec get_header_value(Needle :: binary(), Headers :: [{binary(), binary()}], Default :: any()) -> binary() | any().
 %% @doc Do a case-insensitive header lookup to return that header's value, or the specified default.
 get_header_value(Needle, Headers, Default) ->
-	%io:format("Headers: ~p~n", [Headers]),
+	?log(debug, "Headers: ~p~n", [Headers]),
 	F =
 	fun({Header, _Value}) ->
 			binstr:to_lower(Header) =:= binstr:to_lower(Needle)
@@ -434,7 +475,7 @@ parse_headers(Body, <<H, T/binary>>, Headers) when H =:= $\s; H =:= $\t ->
 	% folded headers
 	[{FieldName, OldFieldValue} | OtherHeaders] = Headers,
 	FieldValue = list_to_binary([OldFieldValue, T]),
-	%io:format("~p = ~p~n", [FieldName, FieldValue]),
+	?log(debug, "~p = ~p~n", [FieldName, FieldValue]),
 	case binstr:strpos(Body, "\r\n") of
 		0 ->
 			{lists:reverse([{FieldName, FieldValue} | OtherHeaders]), Body};
@@ -444,7 +485,7 @@ parse_headers(Body, <<H, T/binary>>, Headers) when H =:= $\s; H =:= $\t ->
 			parse_headers(binstr:substr(Body, Index2 + 2), binstr:substr(Body, 1, Index2 - 1), [{FieldName, FieldValue} | OtherHeaders])
 	end;
 parse_headers(Body, Line, Headers) ->
-	%io:format("line: ~p, nextpart ~p~n", [Line, binstr:substr(Body, 1, 10)]),
+	?log(debug, "line: ~p", [Line]),
 	case binstr:strchr(Line, $:) of
 		0 ->
 			{lists:reverse(Headers), list_to_binary([Line, "\r\n", Body])};
@@ -490,13 +531,8 @@ decode_body(Type, Body, <<"x-binaryenc">>, _OutEncoding) ->
 decode_body(Type, Body, InEncoding, OutEncoding) ->
 	NewBody = decode_body(Type, Body),
 	InEncodingFixed = fix_encoding(InEncoding),
-	CD = case iconv:open(OutEncoding, InEncodingFixed) of
-		{ok, Res} -> Res;
-		{error, einval} -> throw({bad_charset, InEncodingFixed})
-	end,
-	{ok, Result} = iconv:conv(CD, NewBody),
-	iconv:close(CD),
-	Result.
+	{ok, ConvertedBody} = convert(OutEncoding, InEncodingFixed, NewBody),
+	ConvertedBody.
 
 -spec decode_body(Type :: binary() | 'undefined', Body :: binary()) -> binary().
 decode_body(undefined, Body) ->
@@ -529,7 +565,7 @@ decode_quoted_printable(Line, Rest, Acc) ->
 		0 ->
 			decode_quoted_printable(Rest, <<>>, [decode_quoted_printable_line(Line, []) | Acc]);
 		Index ->
-			%io:format("next line ~p~nnext rest ~p~n", [binstr:substr(Rest, 1, Index +1), binstr:substr(Rest, Index + 2)]),
+			?log(debug, "next line ~p~nnext rest ~p~n", [binstr:substr(Rest, 1, Index +1), binstr:substr(Rest, Index + 2)]),
 			decode_quoted_printable(binstr:substr(Rest, 1, Index +1), binstr:substr(Rest, Index + 2),
 				[decode_quoted_printable_line(Line, []) | Acc])
 	end.
@@ -617,79 +653,79 @@ check_headers([Header | Tail], Headers) ->
 
 ensure_content_headers(Type, SubType, Parameters, Headers, Body, Toplevel) ->
 	CheckHeaders = [<<"Content-Type">>, <<"Content-Disposition">>, <<"Content-Transfer-Encoding">>],
-	ensure_content_headers(CheckHeaders, Type, SubType, Parameters, lists:reverse(Headers), Body, Toplevel).
+	CheckHeadersValues = [{Name, get_header_value(Name, Headers)} || Name <- CheckHeaders],
+	ensure_content_headers(CheckHeadersValues, Type, SubType, Parameters, lists:reverse(Headers), Body, Toplevel).
 
 ensure_content_headers([], _, _, Parameters, Headers, _, _) ->
 	{Parameters, lists:reverse(Headers)};
-ensure_content_headers([Header | Tail], Type, SubType, Parameters, Headers, Body, Toplevel) ->
-	case get_header_value(Header, Headers) of
-		undefined when Header == <<"Content-Type">>, ((Type == <<"text">> andalso SubType =/= <<"plain">>) orelse Type =/= <<"text">>) ->
-			% no content-type header, and its not text/plain
-			CT = io_lib:format("~s/~s", [Type, SubType]),
-			CTP = case Type of
-				<<"multipart">> ->
-					Boundary = case proplists:get_value(<<"boundary">>, proplists:get_value(<<"content-type-params">>, Parameters, [])) of
-						undefined ->
-							list_to_binary(smtp_util:generate_message_boundary());
-						B ->
-							B
-					end,
-					[{<<"boundary">>, Boundary} | proplists:delete(<<"boundary">>, proplists:get_value(<<"content-type-params">>, Parameters, []))];
-				<<"text">> ->
-					Charset = case proplists:get_value(<<"charset">>, proplists:get_value(<<"content-type-params">>, Parameters, [])) of
-						undefined ->
-							guess_charset(Body);
-						C ->
-							C
-					end,
-					[{<<"charset">>, Charset} | proplists:delete(<<"charset">>, proplists:get_value(<<"content-type-params">>, Parameters, []))];
-				_ ->
-					proplists:get_value(<<"content-type-params">>, Parameters, [])
-			end,
+ensure_content_headers([{<<"Content-Type">>, undefined} | Tail], Type, SubType, Parameters, Headers, Body, Toplevel)
+  when (Type == <<"text">> andalso SubType =/= <<"plain">>) orelse Type =/= <<"text">> ->
+	%% no content-type header, and its not text/plain
+	CT = io_lib:format("~s/~s", [Type, SubType]),
+	CTP = case Type of
+			  <<"multipart">> ->
+				  Boundary = case proplists:get_value(<<"boundary">>, maps:get(content_type_params, Parameters, [])) of
+								 undefined ->
+									 list_to_binary(smtp_util:generate_message_boundary());
+								 B ->
+									 B
+							 end,
+				  [{<<"boundary">>, Boundary} | proplists:delete(<<"boundary">>, maps:get(content_type_params, Parameters, []))];
+			  <<"text">> ->
+				  Charset = case proplists:get_value(<<"charset">>, maps:get(content_type_params, Parameters, [])) of
+								undefined ->
+									guess_charset(Body);
+								C ->
+									C
+							end,
+				  [{<<"charset">>, Charset} | proplists:delete(<<"charset">>, maps:get(content_type_params, Parameters, []))];
+			  _ ->
+				  maps:get(content_type_params, Parameters, [])
+		  end,
 
-			%CTP = proplists:get_value(<<"content-type-params">>, Parameters, [guess_charset(Body)]),
-			CTH = binstr:join([CT | encode_parameters(CTP)], ";"),
-			NewParameters = [{<<"content-type-params">>, CTP} | proplists:delete(<<"content-type-params">>, Parameters)],
-			ensure_content_headers(Tail, Type, SubType, NewParameters, [{<<"Content-Type">>, CTH} | Headers], Body, Toplevel);
-		undefined when Header == <<"Content-Type">> ->
-			% no content-type header and its text/plain
-			Charset = case proplists:get_value(<<"charset">>, proplists:get_value(<<"content-type-params">>, Parameters, [])) of
-				undefined ->
-					guess_charset(Body);
-				C ->
-					C
-			end,
-			case Charset of
-				<<"us-ascii">> ->
-					% the default
-					ensure_content_headers(Tail, Type, SubType, Parameters, Headers, Body, Toplevel);
-				_ ->
-					CTP = [{<<"charset">>, Charset} | proplists:delete(<<"charset">>, proplists:get_value(<<"content-type-params">>, Parameters, []))],
-					CTH = binstr:join([<<"text/plain">> | encode_parameters(CTP)], ";"),
-					NewParameters = [{<<"content-type-params">>, CTP} | proplists:delete(<<"content-type-params">>, Parameters)],
-					ensure_content_headers(Tail, Type, SubType, NewParameters, [{<<"Content-Type">>, CTH} | Headers], Body, Toplevel)
-			end;
-		undefined when Header == <<"Content-Transfer-Encoding">>, Type =/= <<"multipart">> ->
-			Enc = case proplists:get_value(<<"transfer-encoding">>, Parameters) of
-				undefined ->
-					guess_best_encoding(Body);
-				Value ->
-					Value
-			end,
-			case Enc of
-				<<"7bit">> ->
-					ensure_content_headers(Tail, Type, SubType, Parameters, Headers, Body, Toplevel);
-				_ ->
-					ensure_content_headers(Tail, Type, SubType, Parameters, [{<<"Content-Transfer-Encoding">>, Enc} | Headers], Body, Toplevel)
-			end;
-		undefined when Header == <<"Content-Disposition">>, Toplevel == false ->
-			CD = proplists:get_value(<<"disposition">>, Parameters, <<"inline">>),
-			CDP = proplists:get_value(<<"disposition-params">>, Parameters, []),
-			CDH = binstr:join([CD | encode_parameters(CDP)], ";"),
-			ensure_content_headers(Tail, Type, SubType, Parameters, [{<<"Content-Disposition">>, CDH} | Headers], Body, Toplevel);
+	%%CTP = proplists:get_value(<<"content-type-params">>, Parameters, [guess_charset(Body)]),
+	CTH = binstr:join([CT | encode_parameters(CTP)], ";"),
+	NewParameters = Parameters#{content_type_params => CTP},
+	ensure_content_headers(Tail, Type, SubType, NewParameters, [{<<"Content-Type">>, CTH} | Headers], Body, Toplevel);
+ensure_content_headers([{<<"Content-Type">>, undefined} | Tail], <<"text">> = Type, <<"plain">> = SubType, Parameters, Headers, Body, Toplevel) ->
+	%% no content-type header and its text/plain
+	Charset = case proplists:get_value(<<"charset">>, maps:get(content_type_params, Parameters, [])) of
+				  undefined ->
+					  guess_charset(Body);
+				  C ->
+					  binstr:to_lower(C)
+			  end,
+	case Charset of
+		<<"us-ascii">> ->
+												% the default
+			ensure_content_headers(Tail, Type, SubType, Parameters, Headers, Body, Toplevel);
 		_ ->
-			ensure_content_headers(Tail, Type, SubType, Parameters, Headers, Body, Toplevel)
-	end.
+			CTP = [{<<"charset">>, Charset} | proplists:delete(<<"charset">>, maps:get(content_type_params, Parameters, []))],
+			CTH = binstr:join([<<"text/plain">> | encode_parameters(CTP)], ";"),
+			NewParameters = Parameters#{content_type_params => CTP},
+			ensure_content_headers(Tail, Type, SubType, NewParameters, [{<<"Content-Type">>, CTH} | Headers], Body, Toplevel)
+	end;
+ensure_content_headers([{<<"Content-Transfer-Encoding">>, undefined} | Tail], Type, SubType, Parameters, Headers, Body, Toplevel)
+  when Type =/= <<"multipart">> ->
+	Enc = case maps:get(transfer_encoding, Parameters, undefined) of
+			  undefined ->
+				  guess_best_encoding(Body);
+			  Value ->
+				  Value
+		  end,
+	case Enc of
+		<<"7bit">> ->
+			ensure_content_headers(Tail, Type, SubType, Parameters, Headers, Body, Toplevel);
+		_ ->
+			ensure_content_headers(Tail, Type, SubType, Parameters, [{<<"Content-Transfer-Encoding">>, Enc} | Headers], Body, Toplevel)
+	end;
+ensure_content_headers([{<<"Content-Disposition">>, undefined} | Tail], Type, SubType, Parameters, Headers, Body, false = Toplevel) ->
+	CD = maps:get(disposition, Parameters, <<"inline">>),
+	CDP = maps:get(disposition_params, Parameters, []),
+	CDH = binstr:join([CD | encode_parameters(CDP)], ";"),
+	ensure_content_headers(Tail, Type, SubType, Parameters, [{<<"Content-Disposition">>, CDH} | Headers], Body, Toplevel);
+ensure_content_headers([_ | Tail], Type, SubType, Parameters, Headers, Body, Toplevel) ->
+	ensure_content_headers(Tail, Type, SubType, Parameters, Headers, Body, Toplevel).
 
 guess_charset(Body) ->
 	case binstr:all(fun(X) -> X < 128 end, Body) of
@@ -697,11 +733,18 @@ guess_charset(Body) ->
 		false -> <<"utf-8">>
 	end.
 
-guess_best_encoding(<<Body:200/binary, Rest/binary>>) when Rest =/= <<>> ->
-	guess_best_encoding(Body);
-guess_best_encoding(<<>>) ->
-    <<"7bit">>;
 guess_best_encoding(Body) ->
+	case valid_7bit(Body) of
+		true ->
+			<<"7bit">>;
+		false ->
+			choose_transformation(Body)
+	end.
+
+choose_transformation(<<Chunk:200/binary, _, _/binary>>) ->
+	%% Optimization - only analyze 1st 200 bytes
+	choose_transformation(Chunk);
+choose_transformation(Body) ->
 	Size = byte_size(Body),
 	% get only the allowed ascii characters
 	% TODO - this might not be the complete list
@@ -711,13 +754,51 @@ guess_best_encoding(Body) ->
 
 	%based on the % of printable characters, choose an encoding
 	if
-		Percent == 100 ->
-			<<"7bit">>;
 		Percent > 80 ->
 			<<"quoted-printable">>;
 		true ->
 			<<"base64">>
 	end.
+
+%% https://tools.ietf.org/html/rfc2045#section-2.7:
+%% * ASCII codes from 1 to 127
+%% * \r and \n are ony allowed as `\r\n' pair, but not standalone (bare)
+%% * No lines over 998 chars
+%%
+%% Unfortunately, any string that ends with `\n` matches the regexp, so, we need some pre-checks
+valid_7bit(<<"\n">>) -> false;
+valid_7bit(<<"\r">>) -> false;
+valid_7bit(<<>>) -> true;
+valid_7bit(<<_>>) -> true;
+valid_7bit(Body) ->
+	Size = byte_size(Body),
+	case binary:at(Body, Size - 1) =:= $\n andalso binary:at(Body, Size - 2) =/= $\r of
+		true ->
+			%% last element is \n, but the one before the last is not \r
+			false;
+		false ->
+			%% So: (all except `\r` and `\n` in 1-127 range) OR (`\r\n`)
+			case re:run(Body, "^([\x01-\x09\x0b-\x0c\x0e-\x7f]|(\r\n))*$", [{capture, none}]) of
+				match -> not has_lines_over_998(Body);
+				nomatch -> false
+			end
+	end.
+
+%% @doc If `Body' has at least one line (ending with `\r\n') that is longer than 998 chars
+has_lines_over_998(Body) ->
+	Pattern = binary:compile_pattern(<<"\r\n">>),
+	has_lines_over_998(Body, binary:match(Body, Pattern), 0, Pattern).
+
+has_lines_over_998(Bin, nomatch, Offset, _) ->
+	%% Last line is over 998?
+	(byte_size(Bin) - Offset) >= 998;
+has_lines_over_998(_Bin, {FoundAt, 2}, Offset, _Patern) when (FoundAt - Offset) >= 998 ->
+	true;
+has_lines_over_998(Bin, {FoundAt, 2}, _, Pattern) ->
+	NewOffset = FoundAt + 2,
+	Len = byte_size(Bin) - NewOffset,
+	has_lines_over_998(
+	  Bin, binary:match(Bin, Pattern, [{scope, {NewOffset, Len}}]), NewOffset, Pattern).
 
 encode_parameters([[]]) ->
 	[];
@@ -782,48 +863,44 @@ encode_header_value(H, Value) when H =:= <<"To">>; H =:= <<"Cc">>; H =:= <<"Bcc"
 encode_header_value(_, Value) ->
 	rfc2047_utf8_encode(Value).
 
-encode_component(_Type, _SubType, Headers, Params, Body) ->
-	if
-		is_list(Body) -> % is this a multipart component?
-			Boundary = proplists:get_value(<<"boundary">>, proplists:get_value(<<"content-type-params">>, Params)),
-			[<<>>] ++  % blank line before start of component
-			lists:flatmap(
-				fun(Part) ->
-						[list_to_binary([<<"--">>, Boundary])] ++ % start with the boundary
-						encode_component_part(Part)
-				end,
-				Body
-			) ++ [list_to_binary([<<"--">>, Boundary, <<"--">>])] % final boundary (with /--$/)
-			  ++ [<<>>]; % blank line at the end of the multipart component
-		true -> % or an inline component?
-			%encode_component_part({Type, SubType, Headers, Params, Body})
-			encode_body(
-					get_header_value(<<"Content-Transfer-Encoding">>, Headers),
-					[Body]
-			 )
-	end.
+encode_component(_Type, _SubType, _Headers, Params, Body) when is_list(Body) ->
+    % is this a multipart component?
+	Boundary = proplists:get_value(<<"boundary">>, maps:get(content_type_params, Params)),
+	[<<>>] ++  % blank line before start of component
+	lists:flatmap(
+		fun(Part) ->
+				[list_to_binary([<<"--">>, Boundary])] ++ % start with the boundary
+				encode_component_part(Part)
+		end,
+		Body
+	) ++ [list_to_binary([<<"--">>, Boundary, <<"--">>])] % final boundary (with /--$/)
+	  ++ [<<>>]; % blank line at the end of the multipart component
+encode_component(_Type, _SubType, Headers, _Params, Body) ->
+    % or an inline component?
+	%encode_component_part({Type, SubType, Headers, Params, Body})
+	encode_body(
+		get_header_value(<<"Content-Transfer-Encoding">>, Headers),
+		[Body]
+	).
 
+encode_component_part({<<"multipart">>, SubType, Headers, PartParams, Body}) ->
+	{FixedParams, FixedHeaders} = ensure_content_headers(<<"multipart">>, SubType, PartParams, Headers, Body, false),
+	encode_headers(FixedHeaders) ++
+	encode_component(<<"multipart">>, SubType, FixedHeaders, FixedParams, Body);
+encode_component_part({Type, SubType, Headers, PartParams, Body}) ->
+	PartData = case Body of
+		{_,_,_,_,_} -> encode_component_part(Body);
+		String      -> [String]
+	end,
+	{_FixedParams, FixedHeaders} = ensure_content_headers(Type, SubType, PartParams, Headers, Body, false),
+	encode_headers(FixedHeaders) ++ [<<>>] ++
+	encode_body(
+			get_header_value(<<"Content-Transfer-Encoding">>, FixedHeaders),
+			PartData
+	 );
 encode_component_part(Part) ->
-	case Part of
-		{<<"multipart">>, SubType, Headers, PartParams, Body} ->
-			{FixedParams, FixedHeaders} = ensure_content_headers(<<"multipart">>, SubType, PartParams, Headers, Body, false),
-			encode_headers(FixedHeaders) ++ [<<>>] ++
-			encode_component(<<"multipart">>, SubType, FixedHeaders, FixedParams, Body);
-		{Type, SubType, Headers, PartParams, Body} ->
-			PartData = case Body of
-				{_,_,_,_,_} -> encode_component_part(Body);
-				String      -> [String]
-			end,
-			{_FixedParams, FixedHeaders} = ensure_content_headers(Type, SubType, PartParams, Headers, Body, false),
-			encode_headers(FixedHeaders) ++ [<<>>] ++
-			encode_body(
-					get_header_value(<<"Content-Transfer-Encoding">>, FixedHeaders),
-					PartData
-			 );
-		_ ->
-			io:format("encode_component_part couldn't match Part to: ~p~n", [Part]),
-			[]
-	end.
+	?log(debug, "encode_component_part couldn't match Part to: ~p~n", [Part]),
+	[].
 
 encode_body(undefined, Body) ->
 	Body;
@@ -868,10 +945,8 @@ encode_quoted_printable(Body, Acc, L) when L >= 75 ->
 			encode_quoted_printable(Body, [$\n, $\r, $= | Acc], 0);
 		SIndex when (L - 75) < SIndex ->
 			% okay, we can safely stick some whitespace in
-			Prefix = string:substr(Acc, 1, SIndex-1),
-			Suffix = string:substr(Acc, SIndex),
-			NewAcc = lists:concat([Prefix, "\n\r=", Suffix]),
-			encode_quoted_printable(Body, NewAcc, 0);
+			NewAcc = insert_soft_newline(Acc, SIndex - 1),
+			encode_quoted_printable(Body, NewAcc, SIndex);
 		_ ->
 			% worst case, we're over 75 characters on the line
 			% and there's no obvious break points, just stick one
@@ -881,10 +956,8 @@ encode_quoted_printable(Body, Acc, L) when L >= 75 ->
 
 			% TODO - fix this to be less stupid
 			I = 3, % assume we're at most 3 over our cutoff
-			Prefix = string:substr(Acc, 1, I),
-			Suffix = string:substr(Acc, I+1),
-			NewAcc = lists:concat([Prefix, "\n\r=", Suffix]),
-			encode_quoted_printable(Body, NewAcc, 0)
+			NewAcc = insert_soft_newline(Acc, I),
+			encode_quoted_printable(Body, NewAcc, I)
 	end;
 encode_quoted_printable(<<>>, Acc, _L) ->
 	list_to_binary(lists:reverse(Acc));
@@ -905,6 +978,11 @@ encode_quoted_printable(<<H, T/binary>>, Acc, L) ->
 	[A, B] = lists:flatten(io_lib:format("~2.16.0B", [H])),
 	encode_quoted_printable(T, [B, A, $= | Acc], L+3).
 
+insert_soft_newline([H | T], AfterPos) when AfterPos > 0 ->
+	[H | insert_soft_newline(T, AfterPos - 1)];
+insert_soft_newline(Str, 0) ->
+	[$\n, $\r, $= | Str].
+
 get_default_encoding() ->
 	<<"utf-8//IGNORE">>.
 
@@ -920,7 +998,7 @@ fix_encoding(Encoding) ->
 rfc2047_utf8_encode(undefined) -> undefined;
 rfc2047_utf8_encode(B) when is_binary(B) ->
 	rfc2047_utf8_encode(binary_to_list(B));
-rfc2047_utf8_encode([]) -> 
+rfc2047_utf8_encode([]) ->
 	[];
 rfc2047_utf8_encode(Text) ->
     %% Don't escape when all characters are ASCII printable
@@ -938,12 +1016,12 @@ rfc2047_utf8_encode(T, Acc, WordLen, Char) when WordLen + length(Char) > 73 ->
 rfc2047_utf8_encode([], Acc, _WordLen, Char) ->
     lists:reverse("=?" ++ Char ++ Acc);
 
-%% ASCII characters dont encode except space, ?, _, =, and .
-rfc2047_utf8_encode([C|T], Acc, WordLen, Char) when C > 32 andalso C < 127 andalso C /= 32 
+%% Printable ASCII characters dont encode except space, ?, _, = and .
+rfc2047_utf8_encode([C|T], Acc, WordLen, Char) when C > 32 andalso C < 127 andalso C /= 32
     andalso C /= $? andalso C /= $_ andalso C /= $= andalso C /= $. ->
     rfc2047_utf8_encode(T, Char ++ Acc, WordLen+length(Char), [C]);
 %% Encode all other ASCII
-rfc2047_utf8_encode([C|T], Acc, WordLen, Char) when C >= 32 andalso C < 127 ->
+rfc2047_utf8_encode([C|T], Acc, WordLen, Char) when C > 0 andalso C =< 192 ->
     rfc2047_utf8_encode(T, Char ++ Acc, WordLen+length(Char), encode_byte(C));
 %% First byte of UTF-8 sequence
 %% ensure that encoded 2-4 byte UTF-8 characters keept in one line
@@ -993,17 +1071,7 @@ encode_extra_utf_bytes(Bytes, [C|T], AccOut) when C >= 128 andalso C =< 191 ->
 %% `{pem_encrypted, KeyBinary, Password}' - generated by, eg
 %%  <code>openssl genrsa -des3 -out out-file.pem 1024</code>
 %%  3rd paramerter is password to decrypt the key.
--spec dkim_sign_email([binary()], binary(), Options) -> [binary()]
-																 when
-	  Options:: [{h, [binary()]}
-				 | {d, binary()}
-				 | {s, binary()}
-				 | {t, now | calendar:datetime()}
-				 | {x, calendar:datetime()}
-				 | {c, {simple|relaxed, simple|relaxed}}
-				 | {private_key, PrivateKey}],
-	  PrivateKey :: {pem_plain, binary()}
-					| {pem_encrypted, Key::binary(), Passwd::string()}.
+-spec dkim_sign_email([binary()], binary(), dkim_options()) -> [binary()].
 dkim_sign_email(Headers, Body, Opts) ->
 	HeadersToSign = proplists:get_value(h, Opts, [<<"from">>, <<"to">>, <<"subject">>, <<"date">>]),
 	SDID = proplists:get_value(d, Opts),
@@ -1029,7 +1097,6 @@ dkim_sign_email(Headers, Body, Opts) ->
 	CanHeaders = dkim_canonicalize_headers(Headers1, HdrsCanT),
 	[DkimHeaderNoB] = dkim_canonicalize_headers([dkim_make_header([{b, undefined} | Tags])], HdrsCanT),
 	DataHash = dkim_hash_data(CanHeaders, DkimHeaderNoB),
-	%% io:format("~s~n~n", [base64:encode(DataHash)]),
 	%% sign
 	Signature = dkim_sign(DataHash, PrivateKey),
 	DkimHeader = dkim_make_header([{b, Signature} | Tags]),
@@ -1220,7 +1287,7 @@ parse_with_comments_test_() ->
 			end
 		}
 	].
-	
+
 parse_content_type_test_() ->
 	[
 		{"parsing content types",
@@ -1308,6 +1375,15 @@ parse_example_mails_test_() ->
 				{Type, SubType, _Headers, _Properties, Body} = Decoded,
 				?assertEqual({<<"text">>, <<"plain">>}, {Type, SubType}),
 				?assertEqual(<<"This message contains only plain text.\r\n">>, Body)
+			end
+		},
+		{"parse a Python smtplib plain text email",
+			fun() ->
+				Decoded = Getmail("python-smtp-lib.eml"),
+				?assertEqual(5, tuple_size(Decoded)),
+				{Type, SubType, _Headers, _Properties, Body} = Decoded,
+				?assertEqual({<<"text">>, <<"plain">>}, {Type, SubType}),
+				?assertEqual(<<"Hello world Python.\r\n">>, Body)
 			end
 		},
 		{"parse a plain text email with no content type",
@@ -1419,9 +1495,9 @@ parse_example_mails_test_() ->
 				[H | _] = Body,
 				[{<<"image">>, <<"jpeg">>, _, Parameters, _Image}] = Body,
 				?assertEqual(?IMAGE_MD5, erlang:md5(element(5, H))),
-				?assertEqual(<<"inline">>, proplists:get_value(<<"disposition">>, Parameters)),
-				?assertEqual(<<"chili-pepper.jpg">>, proplists:get_value(<<"filename">>, proplists:get_value(<<"disposition-params">>, Parameters))),
-				?assertEqual(<<"chili-pepper.jpg">>, proplists:get_value(<<"name">>, proplists:get_value(<<"content-type-params">>, Parameters)))
+				?assertEqual(<<"inline">>, maps:get(disposition, Parameters)),
+				?assertEqual(<<"chili-pepper.jpg">>, proplists:get_value(<<"filename">>, maps:get(disposition_params, Parameters))),
+				?assertEqual(<<"chili-pepper.jpg">>, proplists:get_value(<<"name">>, maps:get(content_type_params, Parameters)))
 			end
 		},
 		{"message attachment only",
@@ -1444,12 +1520,22 @@ parse_example_mails_test_() ->
 				?assertMatch({<<"message">>, <<"rfc822">>, _, _, _}, Message),
 				Submessage = element(5, Message),
 				?assertMatch({<<"text">>, <<"plain">>, _, _, <<"This message contains only plain text.\r\n">>}, Submessage),
-				
+
 				?assertMatch({<<"text">>, <<"rtf">>, _, _, _}, Rtf),
 				?assertEqual(<<"{\\rtf1\\ansi\\ansicpg1252\\cocoartf949\\cocoasubrtf460\r\n{\\fonttbl\\f0\\fswiss\\fcharset0 Helvetica;}\r\n{\\colortbl;\\red255\\green255\\blue255;}\r\n\\margl1440\\margr1440\\vieww9000\\viewh8400\\viewkind0\r\n\\pard\\tx720\\tx1440\\tx2160\\tx2880\\tx3600\\tx4320\\tx5040\\tx5760\\tx6480\\tx7200\\tx7920\\tx8640\\ql\\qnatural\\pardirnatural\r\n\r\n\\f0\\fs24 \\cf0 This is a basic rtf file.}">>, element(5, Rtf)),
-				
+
 				?assertMatch({<<"image">>, <<"jpeg">>, _, _, _}, Image),
-				?assertEqual(?IMAGE_MD5, erlang:md5(element(5, Image)))				
+				?assertEqual(?IMAGE_MD5, erlang:md5(element(5, Image)))
+			end
+		},
+		{"alternative text/html with calendar attachment.",
+			fun() ->
+				Decoded = Getmail("message-text-html-attachment.eml"),
+				?assertMatch({<<"multipart">>, <<"mixed">>, _, _, [
+					{<<"multipart">>, <<"alternative">>, _, _, [
+						{<<"text">>, <<"plain">>, _, _, _}, 
+						{<<"text">>, <<"html">>, _, _, _}]}, 
+					{<<"text">>, <<"calendar">>, _, _, _}]}, Decoded)
 			end
 		},
 		{"Outlook 2007 with leading tabs in quoted-printable.",
@@ -1483,20 +1569,20 @@ parse_example_mails_test_() ->
 				?assertMatch({<<"text">>, <<"plain">>, _, _, _}, Toptext),
 				?assertEqual(<<"This is rich text.\r\n\r\nThe list is html.\r\n\r\nAttchments:\r\nan email containing an attachment of an email.\r\nan email of only plain text.\r\nan image\r\nan rtf file.\r\n">>, element(5, Toptext)),
 				?assertEqual(9, length(element(5, Topmultipart))),
-				[Html, Messagewithin, _Brhtml, _Message, _Brhtml, Image, _Brhtml, Rtf, _Brhtml] = element(5, Topmultipart),
+				[Html, Messagewithin, Brhtml, _Message, Brhtml, Image, Brhtml, Rtf, Brhtml] = element(5, Topmultipart),
 				?assertMatch({<<"text">>, <<"html">>, _, _, _}, Html),
 				?assertEqual(<<"<html><body style=\"word-wrap: break-word; -webkit-nbsp-mode: space; -webkit-line-break: after-white-space; \"><b>This</b> is <i>rich</i> text.<div><br></div><div>The list is html.</div><div><br></div><div>Attchments:</div><div><ul class=\"MailOutline\"><li>an email containing an attachment of an email.</li><li>an email of only plain text.</li><li>an image</li><li>an rtf file.</li></ul></div><div></div></body></html>">>, element(5, Html)),
-				
+
 				?assertMatch({<<"message">>, <<"rfc822">>, _, _, _}, Messagewithin),
 				%?assertEqual(1, length(element(5, Messagewithin))),
 				?assertMatch({<<"multipart">>, <<"mixed">>, _, _, [{<<"message">>, <<"rfc822">>, _, _, {<<"text">>, <<"plain">>, _, _, <<"This message contains only plain text.\r\n">>}}]}, element(5, Messagewithin)),
-				
+
 				?assertMatch({<<"image">>, <<"jpeg">>, _, _, _}, Image),
 				?assertEqual(?IMAGE_MD5, erlang:md5(element(5, Image))),
-				
+
 				?assertMatch({<<"text">>, <<"rtf">>, _, _, _}, Rtf),
 				?assertEqual(<<"{\\rtf1\\ansi\\ansicpg1252\\cocoartf949\\cocoasubrtf460\r\n{\\fonttbl\\f0\\fswiss\\fcharset0 Helvetica;}\r\n{\\colortbl;\\red255\\green255\\blue255;}\r\n\\margl1440\\margr1440\\vieww9000\\viewh8400\\viewkind0\r\n\\pard\\tx720\\tx1440\\tx2160\\tx2880\\tx3600\\tx4320\\tx5040\\tx5760\\tx6480\\tx7200\\tx7920\\tx8640\\ql\\qnatural\\pardirnatural\r\n\r\n\\f0\\fs24 \\cf0 This is a basic rtf file.}">>, element(5, Rtf))
-				
+
 			end
 		},
 		{"Plain text and 2 identical attachments",
@@ -1532,11 +1618,11 @@ parse_example_mails_test_() ->
 				{<<"text">>, _, _, _, InlineBody} = Inline,
 				{<<"text">>, _, _, ContentHeaders, _AttachmentBody} = Attachment,
 				ContentTypeName = proplists:get_value(
-									<<"name">>, proplists:get_value(
-												  <<"content-type-params">>, ContentHeaders)),
+									<<"name">>, maps:get(
+												  content_type_params, ContentHeaders)),
 				DispositionName = proplists:get_value(
-									<<"filename">>, proplists:get_value(
-													  <<"disposition-params">>, ContentHeaders)),
+									<<"filename">>, maps:get(
+													  disposition_params, ContentHeaders)),
 
 				?assertEqual(<<"Hello\r\n">>, InlineBody),
 				?assert(ContentTypeName == DispositionName),
@@ -1676,13 +1762,13 @@ decode_quoted_printable_test_() ->
 					?assertThrow(badchar, decode_quoted_printable(<<"=21=D1 = g ">>))
 			end
 		},
-		%% TODO zotonic's iconv throws eilseq here
-		%{"out of range characters should be stripped",
-			%fun() ->
-				% character 150 is en-dash in windows 1252
-				%?assertEqual(<<"Foo  bar"/utf8>>, decode_body(<<"quoted-printable">>, <<"Foo ", 150, " bar">>, "US-ASCII", "UTF-8//IGNORE"))
-			%end
-		%},
+		%% TODO zotonic's iconv throws eilseq here.
+		% {"out of range characters should be stripped",
+		% 	fun() ->
+		% 		% character 150 is en-dash in windows 1252
+		% 		?assertEqual(<<"Foo  bar"/utf8>>, decode_body(<<"quoted-printable">>, <<"Foo ", 150, " bar">>, "US-ASCII", "UTF-8//IGNORE"))
+		% 	end
+		% },
 		{"out of range character in alternate charset should be converted",
 			fun() ->
 				% character 150 is en-dash in windows 1252
@@ -1709,6 +1795,33 @@ decode_quoted_printable_test_() ->
 			end
 		}
 	].
+
+valid_smtp_mime_7bit_test() ->
+	?assert(valid_7bit(<<>>)),
+	?assert(valid_7bit(<<"abcdefghijklmnopqrstuvwxyz0123456789">>)),
+	?assert(valid_7bit(<<"abc\r\ndef">>)),
+	AllValidRange = (lists:seq(1, $\n - 1)
+					 ++ lists:seq($\n + 1, $\r - 1)
+					 ++ lists:seq($\r + 1, 127)),
+	?assert(valid_7bit(list_to_binary(AllValidRange))),
+	?assertNot(valid_7bit(<<"\n">>)),
+	?assertNot(valid_7bit(<<"\r">>)),
+	?assertNot(valid_7bit(<<"abc\ndef">>)),
+	?assertNot(valid_7bit(<<"abc\rdef">>)),
+	?assertNot(valid_7bit(<<"abc\n\rdef">>)),
+	?assertNot(valid_7bit(<<128, 200, 255>>)),
+	?assertNot(valid_7bit(<<0, 0, 0>>)),
+	?assertNot(valid_7bit(<<"hello", 128, 0, 200>>)),
+	%% Long lines
+	Line800 = binary:copy(<<$a>>, 800),
+	?assertNot(has_lines_over_998(Line800)),
+	Many800Lines = list_to_binary(lists:join("\r\n", lists:duplicate(10, Line800))),
+	?assertNot(has_lines_over_998(Many800Lines)),
+	Line1000 = binary:copy(<<$a>>, 1000),
+	?assert(has_lines_over_998(Line1000)),
+	Many1000Lines = list_to_binary(lists:join("\r\n", lists:duplicate(10, Line1000))),
+	?assert(has_lines_over_998(Many1000Lines)),
+	?assert(has_lines_over_998(<<Line800/binary, "\r\n", Line1000/binary>>)).
 
 encode_quoted_printable_test_() ->
 	[
@@ -1827,7 +1940,7 @@ rfc2047_decode_test_() ->
 		},
 		{"invalid character sequence handling",
 			fun() ->
-					?assertError({badmatch, {error, eilseq}}, decode_header(<<"=?us-ascii?B?dGhpcyBjb250YWlucyBhIGNvcHlyaWdodCCpIHN5bWJvbA==?=">>, "utf-8")),
+					?assertException(throw, eilseq, decode_header(<<"=?us-ascii?B?dGhpcyBjb250YWlucyBhIGNvcHlyaWdodCCpIHN5bWJvbA==?=">>, "utf-8")),
 					%?assertEqual(<<"this contains a copyright  symbol"/utf8>>, decode_header(<<"=?us-ascii?B?dGhpcyBjb250YWlucyBhIGNvcHlyaWdodCCpIHN5bWJvbA==?=">>, "utf-8//IGNORE")),
 					?assertEqual(<<"this contains a copyright © symbol"/utf8>>, decode_header(<<"=?iso-8859-1?B?dGhpcyBjb250YWlucyBhIGNvcHlyaWdodCCpIHN5bWJvbA==?=">>, "utf-8//IGNORE"))
 			end
@@ -1847,6 +1960,10 @@ rfc2047_decode_test_() ->
 	].
 
 encoding_test_() ->
+	Getmail = fun(File) ->
+		{ok, Email} = file:read_file(filename:join("test/fixtures/", File)),
+		decode(Email)
+	end,
 	[
 		{"Simple email",
 			fun() ->
@@ -1857,9 +1974,9 @@ encoding_test_() ->
 							{<<"Message-ID">>, <<"<abcd@example.com>">>},
 							{<<"MIME-Version">>, <<"1.0">>},
 							{<<"Date">>, <<"Sun, 01 Nov 2009 14:44:47 +0200">>}],
-						[{<<"content-type-params">>,
-								[{<<"charset">>,<<"US-ASCII">>}],
-								{<<"disposition">>,<<"inline">>}}],
+						#{content_type_params =>
+                              [{<<"charset">>,<<"US-ASCII">>}],
+                          disposition => <<"inline">>},
 						<<"This is a plain message">>},
 					Result = <<"From: me@example.com\r\nTo: you@example.com\r\nSubject: This is a test\r\nMessage-ID: <abcd@example.com>\r\nMIME-Version: 1.0\r\nDate: Sun, 01 Nov 2009 14:44:47 +0200\r\n\r\nThis is a plain message">>,
 					?assertEqual(Result, encode(Email))
@@ -1874,9 +1991,9 @@ encoding_test_() ->
 							{<<"Message-ID">>, <<"<abcd@example.com>">>},
 							{<<"MIME-Version">>, <<"1.0">>},
 							{<<"Date">>, <<"Sun, 01 Nov 2009 14:44:47 +0200">>}],
-						[{<<"content-type-params">>,
-								[{<<"charset">>,<<"US-ASCII">>}],
-								{<<"disposition">>,<<"inline">>}}],
+						#{content_type_params =>
+                              [{<<"charset">>,<<"US-ASCII">>}],
+                          disposition => <<"inline">>},
 						<<"This is a plain message">>},
 					Result = <<"Subject: =?UTF-8?Q?Fr=C3=A6derik=20H=C3=B8lljen?=\r\nFrom: =?UTF-8?Q?Fr=C3=A6derik=20H=C3=B8lljen?= <me@example.com>\r\nTo: you@example.com\r\nMessage-ID: <abcd@example.com>\r\nMIME-Version: 1.0\r\nDate: Sun, 01 Nov 2009 14:44:47 +0200\r\n\r\nThis is a plain message">>,
 					?assertEqual(Result, encode(Email))
@@ -1889,7 +2006,7 @@ encoding_test_() ->
 							{<<"Message-ID">>, <<"<abcd@example.com>">>},
 							{<<"MIME-Version">>, <<"1.0">>},
 							{<<"Date">>, <<"Sun, 01 Nov 2009 14:44:47 +0200">>}],
-						[],
+						#{},
 						<<"This is a plain message">>},
 					Result = <<"From: \"Admin & ' ( \\\"hallo\\\" ) ; , [ ] WS\" <a@example.com>\r\nMessage-ID: <abcd@example.com>\r\nMIME-Version: 1.0\r\nDate: Sun, 01 Nov 2009 14:44:47 +0200\r\n\r\nThis is a plain message">>,
 					?assertEqual(Result, encode(Email))
@@ -1904,27 +2021,27 @@ encoding_test_() ->
 							{<<"MIME-Version">>, <<"1.0">>},
 							{<<"Content-Type">>,
 								<<"multipart/alternative; boundary=wtf-123234234">>}],
-						[{<<"content-type-params">>,
-								[{<<"boundary">>, <<"wtf-123234234">>}]},
-							{<<"disposition">>,<<"inline">>},
-							{<<"disposition-params">>,[]}],
+						#{content_type_params =>
+                              [{<<"boundary">>, <<"wtf-123234234">>}],
+                          disposition => <<"inline">>,
+                          disposition_params => []},
 						[{<<"text">>,<<"plain">>,
 								[{<<"Content-Type">>,
 										<<"text/plain;charset=US-ASCII;format=flowed">>},
 									{<<"Content-Transfer-Encoding">>,<<"7bit">>}],
-								[{<<"content-type-params">>,
+								#{content_type_params =>
 										[{<<"charset">>,<<"US-ASCII">>},
-											{<<"format">>,<<"flowed">>}]},
-									{<<"disposition">>,<<"inline">>},
-									{<<"disposition-params">>,[]}],
+											{<<"format">>,<<"flowed">>}],
+                                  disposition => <<"inline">>,
+                                  disposition_params => []},
 								<<"This message contains rich text.">>},
 							{<<"text">>,<<"html">>,
 								[{<<"Content-Type">>,<<"text/html;charset=US-ASCII">>},
 									{<<"Content-Transfer-Encoding">>,<<"7bit">>}],
-								[{<<"content-type-params">>,
-										[{<<"charset">>,<<"US-ASCII">>}]},
-									{<<"disposition">>,<<"inline">>},
-									{<<"disposition-params">>,[]}],
+								#{content_type_params =>
+										[{<<"charset">>,<<"US-ASCII">>}],
+                                  disposition => <<"inline">>,
+                                  disposition_params =>[]},
 								<<"<html><body>This message also contains HTML</body></html>">>}]},
 					Result = decode(encode(Email)),
 					?assertMatch({<<"multipart">>, <<"alternative">>, _, _, [{<<"text">>,
@@ -1941,28 +2058,28 @@ encoding_test_() ->
 							{<<"MIME-Version">>, <<"1.0">>},
 							{<<"Content-Type">>,
 								<<"multipart/alternative; boundary=wtf-123234234">>}],
-						[{<<"content-type-params">>,
-								[{<<"boundary">>, <<"wtf-123234234">>}]},
-							{<<"disposition">>,<<"inline">>},
-							{<<"disposition-params">>,[]}],
+						#{content_type_params =>
+                              [{<<"boundary">>, <<"wtf-123234234">>}],
+                          disposition => <<"inline">>,
+                          disposition_params => []},
 						[{<<"text">>,<<"plain">>,
 								[{<<"Content-Type">>,
 										<<"text/plain;charset=US-ASCII;format=flowed">>},
 									{<<"Content-Transfer-Encoding">>,<<"quoted-printable">>}],
-								[{<<"content-type-params">>,
-										[{<<"charset">>,<<"US-ASCII">>},
-											{<<"format">>,<<"flowed">>}]},
-									{<<"disposition">>,<<"inline">>},
-									{<<"disposition-params">>,[]}],
+								#{content_type_params =>
+                                      [{<<"charset">>,<<"US-ASCII">>},
+                                       {<<"format">>,<<"flowed">>}],
+                                  disposition => <<"inline">>,
+                                  disposition_params => []},
 								<<"This message contains rich text.\r\n",
 								"and is =quoted printable= encoded!">>},
 							{<<"text">>,<<"html">>,
 								[{<<"Content-Type">>,<<"text/html;charset=US-ASCII">>},
 									{<<"Content-Transfer-Encoding">>,<<"base64">>}],
-								[{<<"content-type-params">>,
-										[{<<"charset">>,<<"US-ASCII">>}]},
-									{<<"disposition">>,<<"inline">>},
-									{<<"disposition-params">>,[]}],
+								#{content_type_params =>
+                                     [{<<"charset">>,<<"US-ASCII">>}],
+                                  disposition => <<"inline">>,
+                                  disposition_params => []},
 								<<"<html><body>This message also contains",
 								"HTML and is base64",
 								"encoded\r\n\r\n</body></html>">>}]},
@@ -1977,15 +2094,23 @@ encoding_test_() ->
 						Result)
 			end
 		},
+		{"multipart/mixed email with multipart/alternative does not add an extra empty lines",
+			fun() ->
+					Email = Getmail("message-text-html-attachment.eml"),
+					Encoded = encode(Email),
+					Re = re:run(Encoded, "(?:\\r\\n){3}", [global, {capture, all, binary}]),
+					?assertMatch({match, [_]}, Re)
+			end
+		},
 		{"Missing headers should be added",
 			fun() ->
 					Email = {<<"text">>, <<"plain">>, [
 							{<<"From">>, <<"me@example.com">>},
 							{<<"To">>, <<"you@example.com">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[{<<"content-type-params">>,
-								[{<<"charset">>,<<"US-ASCII">>}],
-								{<<"disposition">>,<<"inline">>}}],
+						#{content_type_params =>
+                              [{<<"charset">>,<<"US-ASCII">>}],
+                          disposition => <<"inline">>},
 						<<"This is a plain message">>},
 					Result = decode(encode(Email)),
 					?assertNot(undefined == proplists:get_value(<<"Message-ID">>, element(3, Result))),
@@ -2000,9 +2125,9 @@ encoding_test_() ->
 							{<<"To">>, <<"you@example.com">>},
 							{<<"In-Reply-To">>, <<"<abcd@example.com>">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[{<<"content-type-params">>,
+						#{content_type_params =>
 								[{<<"charset">>,<<"US-ASCII">>}],
-								{<<"disposition">>,<<"inline">>}}],
+                          disposition => <<"inline">>},
 						<<"This is a plain message">>},
 					Result = decode(encode(Email)),
 					?assertEqual(<<"<abcd@example.com>">>, proplists:get_value(<<"References">>, element(3, Result)))
@@ -2016,9 +2141,9 @@ encoding_test_() ->
 							{<<"In-Reply-To">>, <<"<abcd@example.com>">>},
 							{<<"References">>, <<"<wxyz@example.com>">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[{<<"content-type-params">>,
-								[{<<"charset">>,<<"US-ASCII">>}],
-								{<<"disposition">>,<<"inline">>}}],
+						#{content_type_params =>
+                              [{<<"charset">>,<<"US-ASCII">>}],
+                          disposition => <<"inline">>},
 						<<"This is a plain message">>},
 					Result = decode(encode(Email)),
 					?assertEqual(<<"<wxyz@example.com> <abcd@example.com>">>, proplists:get_value(<<"References">>, element(3, Result)))
@@ -2032,9 +2157,9 @@ encoding_test_() ->
 							{<<"In-Reply-To">>, <<"<abcd@example.com>">>},
 							{<<"References">>, <<"<wxyz@example.com> <abcd@example.com>">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[{<<"content-type-params">>,
-								[{<<"charset">>,<<"US-ASCII">>}],
-								{<<"disposition">>,<<"inline">>}}],
+						#{content_type_params =>
+                              [{<<"charset">>,<<"US-ASCII">>}],
+                          disposition => <<"inline">>},
 						<<"This is a plain message">>},
 					Result = decode(encode(Email)),
 					?assertEqual(<<"<wxyz@example.com> <abcd@example.com>">>, proplists:get_value(<<"References">>, element(3, Result)))
@@ -2046,7 +2171,7 @@ encoding_test_() ->
 							{<<"From">>, <<"me@example.com">>},
 							{<<"To">>, <<"you@example.com">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[],
+						#{},
 						<<"This is a plain message with some non-ascii characters øÿ\r\nso there"/utf8>>},
 					Encoded = encode(Email),
 					Result = decode(Encoded),
@@ -2055,7 +2180,7 @@ encoding_test_() ->
 							{<<"From">>, <<"me@example.com">>},
 							{<<"To">>, <<"you@example.com">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[],
+						#{},
 						<<"This is a plain message with no non-ascii characters">>},
 					Encoded2 = encode(Email2),
 					Result2 = decode(Encoded2),
@@ -2064,7 +2189,7 @@ encoding_test_() ->
 							{<<"From">>, <<"me@example.com">>},
 							{<<"To">>, <<"you@example.com">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[{<<"transfer-encoding">>, <<"base64">>}],
+						#{transfer_encoding => <<"base64">>},
 						<<"This is a plain message with no non-ascii characters">>},
 					Encoded3 = encode(Email3),
 					Result3 = decode(Encoded3),
@@ -2077,7 +2202,7 @@ encoding_test_() ->
 							{<<"From">>, <<"me@example.com">>},
 							{<<"To">>, <<"you@example.com">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[],
+						#{},
 						<<"This is a HTML message with some non-ascii characters øÿ\r\nso there"/utf8>>},
 					Encoded = encode(Email),
 					Result = decode(Encoded),
@@ -2087,7 +2212,7 @@ encoding_test_() ->
 							{<<"From">>, <<"me@example.com">>},
 							{<<"To">>, <<"you@example.com">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[],
+						#{},
 						<<"This is a HTML message with no non-ascii characters\r\nso there">>},
 					Encoded2 = encode(Email2),
 					Result2 = decode(Encoded2),
@@ -2096,7 +2221,7 @@ encoding_test_() ->
 							{<<"From">>, <<"me@example.com">>},
 							{<<"To">>, <<"you@example.com">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[],
+						#{},
 						<<"This is a text message with some invisible non-ascii characters\r\nso there"/utf8>>},
 					Encoded3 = encode(Email3),
 					Result3 = decode(Encoded3),
@@ -2109,8 +2234,8 @@ encoding_test_() ->
 							{<<"From">>, <<"me@example.com">>},
 							{<<"To">>, <<"you@example.com">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[],
-						[{<<"text">>, <<"plain">>, [], [], <<"This is a multipart message with some invisible non-ascii characters\r\nso there"/utf8>>}]},
+						#{},
+						[{<<"text">>, <<"plain">>, [], #{}, <<"This is a multipart message with some invisible non-ascii characters\r\nso there"/utf8>>}]},
 					Encoded4 = encode(Email4),
 					Result4 = decode(Encoded4),
 					?assertMatch(<<"text/plain;charset=utf-8">>, proplists:get_value(<<"Content-Type">>, element(3, lists:nth(1,element(5, Result4)))))
@@ -2122,8 +2247,8 @@ encoding_test_() ->
 							{<<"From">>, <<"me@example.com">>},
 							{<<"To">>, <<"you@example.com">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[],
-						[{<<"text">>, <<"plain">>, [], [], <<"This is a multipart message with no non-ascii characters\r\nso there">>}]},
+						#{},
+						[{<<"text">>, <<"plain">>, [], #{}, <<"This is a multipart message with no non-ascii characters\r\nso there">>}]},
 					Encoded4 = encode(Email4),
 					Result4 = decode(Encoded4),
 					?assertMatch(undefined, proplists:get_value(<<"Content-Type">>, element(3, lists:nth(1,element(5, Result4)))))
@@ -2135,8 +2260,8 @@ encoding_test_() ->
 							{<<"From">>, <<"me@example.com">>},
 							{<<"To">>, <<"you@example.com">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[],
-						[{<<"text">>, <<"html">>, [], [], <<"This is a multipart message with no non-ascii characters\r\nso there">>}]},
+						#{},
+						[{<<"text">>, <<"html">>, [], #{}, <<"This is a multipart message with no non-ascii characters\r\nso there">>}]},
 					Encoded4 = encode(Email4),
 					Result4 = decode(Encoded4),
 					?assertMatch(<<"text/html;charset=us-ascii">>, proplists:get_value(<<"Content-Type">>, element(3, lists:nth(1,element(5, Result4)))))
@@ -2148,21 +2273,21 @@ encoding_test_() ->
 							{<<"From">>, <<"me@example.com">>},
 							{<<"To">>, <<"you@example.com">>},
 							{<<"Subject">>, <<"This is a test">>}],
-						[],
+						#{},
 						[{<<"text">>,<<"plain">>,
 								[],
-								[],
+								#{},
 								<<"This message contains rich text.\r\n",
 								"and is =quoted printable= encoded!">>},
 							{<<"text">>,<<"html">>,
 								[],
-								[],
+								#{},
 								<<"<html><body>This message also contains",
 								"HTML and is base64",
 								"encoded\r\n\r\n</body></html>">>}]},
 					Encoded = encode(Email),
 					Result = decode(Encoded),
-					Boundary = proplists:get_value(<<"boundary">>, proplists:get_value(<<"content-type-params">>, element(4, Result))),
+					Boundary = proplists:get_value(<<"boundary">>, maps:get(content_type_params, element(4, Result))),
 					?assert(is_binary(Boundary)),
 					% ensure we don't add the header multiple times
 					?assertEqual(1, length(proplists:get_all_values(<<"Content-Type">>, element(3, Result)))),
@@ -2186,7 +2311,8 @@ roundtrip_test_() ->
 					%file:write(F2, Encoded),
 					%file:close(F1),
 					%file:close(F2),
-					?assertEqual(Email, Email)
+					%?assertEqual(Email, Email),
+                    ok
 			end
 		},
 		{"round trip plain text only email",
@@ -2200,7 +2326,8 @@ roundtrip_test_() ->
 					%file:write(F2, Encoded),
 					%file:close(F1),
 					%file:close(F2),
-					?assertEqual(Email, Email)
+					%?assertEqual(Email, Email),
+                    ok
 			end
 		},
 		{"round trip quoted-printable email",
@@ -2214,8 +2341,8 @@ roundtrip_test_() ->
 					%file:write(F2, Encoded),
 					%file:close(F1),
 					%file:close(F2),
-					?assertEqual(Email, Email)
-					%ok
+					%?assertEqual(Email, Email),
+					ok
 			end
 		}
 	].
@@ -2256,7 +2383,7 @@ dkim_sign_test_() ->
 						{<<"Date">>, <<"Thu, 28 Nov 2013 04:15:44 +0400">>},
 						{<<"Message-ID">>, <<"the-id">>},
 						{<<"Content-Type">>, <<"text/plain; charset=utf-8">>}],
-					   [],
+					   #{},
 					   <<"123">>},
 			  Options = [{dkim, [{s, <<"foo.bar">>},
 								 {d, <<"example.com">>},
@@ -2290,7 +2417,7 @@ dkim_sign_test_() ->
 						{<<"Date">>, <<"Thu, 28 Nov 2013 04:15:44 +0400">>},
 						{<<"Message-ID">>, <<"the-id-relaxed">>},
 						{<<"Content-Type">>, <<"text/plain; charset=utf-8">>}],
-					   [],
+					   #{},
 					   <<"123">>},
 			  Options = [{dkim, [{s, <<"foo.bar">>},
 								 {d, <<"example.com">>},
@@ -2300,7 +2427,6 @@ dkim_sign_test_() ->
 			  Enc = encode(Email, Options),
 			  file:write_file("/home/seriy/relaxed-signed.eml", Enc),
 			  {_, _, [{DkimHdrName, DkimHdrVal} | _], _, _} = decode(Enc),
-			  %% io:format(user, "~p", [DkimHdrVal]),
 			  ?assertEqual(<<"DKIM-Signature">>, DkimHdrName),
 			  ?assertEqual(
 				 <<"s=foo.bar; h=from:to:subject:date; d=example.com; c=relaxed/simple; "

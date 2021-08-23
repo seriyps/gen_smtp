@@ -30,12 +30,14 @@
          combine_rfc822_addresses/1,
          generate_message_boundary/0]).
 
+-include_lib("kernel/include/inet.hrl").
+
 %% @doc returns a sorted list of mx servers for `Domain', lowest distance first
 mxlookup(Domain) ->
 	case whereis(inet_db) of
 		P when is_pid(P) ->
 			ok;
-		_ -> 
+		_ ->
 			inet_db:start()
 	end,
 	case lists:keyfind(nameserver, 1, inet_db:get_rc()) of
@@ -52,23 +54,43 @@ mxlookup(Domain) ->
 			lists:sort(fun({Pref, _Name}, {Pref2, _Name2}) -> Pref =< Pref2 end, Result)
 	end.
 
-%% @doc guess the current host's fully qualified domain name
+%% @doc guess the current host's fully qualified domain name, on error return "localhost"
+-spec guess_FQDN() -> string().
 guess_FQDN() ->
 	{ok, Hostname} = inet:gethostname(),
-	{ok, Hostent} = inet:gethostbyname(Hostname),
-	{hostent, FQDN, _Aliases, inet, _, _Addresses} = Hostent,
-	FQDN.
+    guess_FQDN_1(Hostname, inet:gethostbyname(Hostname)).
+
+guess_FQDN_1(_Hostname, {ok, #hostent{ h_name = FQDN }}) ->
+	FQDN;
+guess_FQDN_1(Hostname, {error, nxdomain = Error}) ->
+    error_logger:info_msg("~p could not get FQDN for ~p (error ~p), using \"localhost\" instead.",
+                          [?MODULE, Error, Hostname]),
+    "localhost".
 
 %% @doc Compute the CRAM digest of `Key' and `Data'
 -spec compute_cram_digest(Key :: binary(), Data :: binary()) -> binary().
 compute_cram_digest(Key, Data) ->
-	Bin = crypto:hmac(md5, Key, Data),
+	Bin = hmac_md5(Key, Data),
 	list_to_binary([io_lib:format("~2.16.0b", [X]) || <<X>> <= Bin]).
+
+-ifdef(OTP_RELEASE).
+  -if(?OTP_RELEASE >= 23).
+    -define(CRYPTO_MAC, true).
+  -endif.
+-endif.
+
+-ifdef(CRYPTO_MAC).
+hmac_md5(Key, Data) ->
+	crypto:mac(hmac, md5, Key, Data).
+-else.
+hmac_md5(Key, Data) ->
+	crypto:hmac(md5, Key, Data).
+-endif.
 
 %% @doc Generate a seed string for CRAM.
 -spec get_cram_string(Hostname :: string()) -> string().
 get_cram_string(Hostname) ->
-	binary_to_list(base64:encode(lists:flatten(io_lib:format("<~B.~B@~s>", [crypto:rand_uniform(0, 4294967295), crypto:rand_uniform(0, 4294967295), Hostname])))).
+	binary_to_list(base64:encode(lists:flatten(io_lib:format("<~B.~B@~s>", [rand:uniform(4294967295), rand:uniform(4294967295), Hostname])))).
 
 %% @doc Trim \r\n from `String'
 -spec trim_crlf(String :: string()) -> string().
@@ -101,7 +123,7 @@ zone(Val) when Val < 0 ->
 zone(Val) when Val >= 0 ->
 	io_lib:format("+~4..0w", [trunc(abs(Val))]).
 
-%% @doc Generate a unique message ID 
+%% @doc Generate a unique message ID
 generate_message_id() ->
 	FQDN = guess_FQDN(),
     Md5 = [io_lib:format("~2.16.0b", [X]) || <<X>> <= erlang:md5(term_to_binary([unique_id(), FQDN]))],
@@ -112,13 +134,8 @@ generate_message_boundary() ->
 	FQDN = guess_FQDN(),
     ["_=", [io_lib:format("~2.36.0b", [X]) || <<X>> <= erlang:md5(term_to_binary([unique_id(), FQDN]))], "=_"].
 
--ifdef(deprecated_now).
 unique_id() ->
     {erlang:system_time(), erlang:unique_integer()}.
--else.
-unique_id() ->
-    erlang:now().
--endif.
 
 -define(is_whitespace(Ch), (Ch =< 32)).
 

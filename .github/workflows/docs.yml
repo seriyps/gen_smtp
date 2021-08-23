@@ -1,0 +1,27 @@
+# Build gen-smtp edoc on various OTP versions
+
+name: Documentation
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+jobs:
+  ci:
+    name: Run checks and tests over ${{matrix.otp_vsn}} and ${{matrix.os}}
+    runs-on: ${{matrix.os}}
+
+    strategy:
+      matrix:
+        otp_vsn: [21.3, 22.3, 23.3, 24.0]
+        os: [ubuntu-latest]
+
+    container:
+      image: erlang:${{matrix.otp_vsn}}
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Documentation
+        run: make docs

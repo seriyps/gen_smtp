@@ -1,7 +1,0 @@
-language: erlang
-notifications:
-  email: you@example.org
-otp_release:
-  - 18.0
-  - 17.4
-  - R16B
